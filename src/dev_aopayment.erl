@@ -64,32 +64,15 @@ ingest(Base, Req, NodeMsg) ->
     end.
 
 %% @doc Submit a real AO transfer from the node wallet to the configured
-%% beneficiary. This is guarded by a boot-generated secret so the route is not
-%% an arbitrary signing endpoint when exposed over HTTP.
+%% beneficiary. This is guarded by either a boot-generated secret or a verified
+%% operator-signed request so the route is not an arbitrary signing endpoint
+%% when exposed over HTTP.
 withdraw(Base, Req, NodeMsg) ->
     case validate_withdrawal(Base, Req, NodeMsg) of
         {ok, Withdrawal} ->
             Key = withdrawal_key(Withdrawal),
             Withdrawals = hb_opts:get(ao_payment_withdrawals, #{}, NodeMsg),
-            case maps:find(Key, Withdrawals) of
-                {ok, Existing} ->
-                    {ok, Existing#{ <<"status">> => <<"already-submitted">> }};
-                error ->
-                    case submit_withdrawal(Withdrawal, NodeMsg) of
-                        {ok, Result} ->
-                            Stored = Result#{ <<"status">> => <<"submitted">> },
-                            hb_http_server:set_opts(
-                                #{},
-                                NodeMsg#{
-                                    <<"ao-payment-withdrawals">> =>
-                                        Withdrawals#{ Key => Stored }
-                                }
-                            ),
-                            {ok, Stored};
-                        Error ->
-                            Error
-                    end
-            end;
+            submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg);
         Error ->
             Error
     end.
@@ -123,14 +106,22 @@ charge(Base, Req, NodeMsg) ->
         LedgerPath ->
             LedgerRoute = normalize_route(LedgerPath),
             LedgerOpts = ledger_resolve_opts(NodeMsg),
-            hb_ao:resolve(
+            case hb_ao:resolve(
                 #{
                     <<"path">> => <<"(", LedgerRoute/binary, ")/push">>,
                     <<"method">> => <<"POST">>,
                     <<"body">> => Req
                 },
                 LedgerOpts
-            )
+            ) of
+                {ok, Result} ->
+                    case auto_withdraw_after_charge(Base, Req, NodeMsg) of
+                        {ok, _WithdrawalResult} -> {ok, Result};
+                        {error, Error} -> {error, Error}
+                    end;
+                Error ->
+                    Error
+            end
     end.
 
 %% @doc Verify that an AO message produced matching token debit/credit notices.
@@ -413,6 +404,110 @@ store_import(PaymentKey, Payment, Imports, NodeMsg) ->
     ),
     NewImports.
 
+submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg) ->
+    case maps:find(Key, Withdrawals) of
+        {ok, Existing} ->
+            {ok, Existing#{ <<"status">> => <<"already-submitted">> }};
+        error ->
+            case submit_withdrawal(Withdrawal, NodeMsg) of
+                {ok, Result} ->
+                    Stored = Result#{ <<"status">> => <<"submitted">> },
+                    NewWithdrawals = Withdrawals#{ Key => Stored },
+                    hb_http_server:set_opts(
+                        #{},
+                        NodeMsg#{
+                            ao_payment_withdrawals => NewWithdrawals,
+                            <<"ao-payment-withdrawals">> => NewWithdrawals
+                        }
+                    ),
+                    {ok, Stored};
+                Error ->
+                    Error
+            end
+    end.
+
+auto_withdraw_after_charge(Base, Req, NodeMsg) ->
+    case auto_withdraw_enabled(Base, NodeMsg) of
+        false ->
+            {ok, skipped};
+        true ->
+            case auto_withdrawal_from_charge(Base, Req, NodeMsg) of
+                {ok, Withdrawal} ->
+                    Key = withdrawal_key(Withdrawal),
+                    Withdrawals = hb_opts:get(ao_payment_withdrawals, #{}, NodeMsg),
+                    submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg);
+                Error ->
+                    Error
+            end
+    end.
+
+auto_withdraw_enabled(Base, NodeMsg) ->
+    enabled(
+        hb_maps:get(
+            <<"auto-withdraw">>,
+            Base,
+            configured_value(
+                <<"ao-payment-auto-withdraw">>,
+                ao_payment_auto_withdraw,
+                false,
+                NodeMsg
+            ),
+            NodeMsg
+        )
+    ).
+
+auto_withdrawal_from_charge(Base, Req, NodeMsg) ->
+    Token =
+        hb_maps:get(
+            <<"withdraw-token">>,
+            Base,
+            configured_value(
+                <<"ao-payment-token">>,
+                ao_payment_token,
+                ?DEFAULT_AO_TOKEN,
+                NodeMsg
+            ),
+            NodeMsg
+        ),
+    Recipient =
+        hb_maps:get(
+            <<"withdraw-recipient">>,
+            Base,
+            configured_value(
+                <<"ao-payment-withdraw-recipient">>,
+                ao_payment_withdraw_recipient,
+                undefined,
+                NodeMsg
+            ),
+            NodeMsg
+        ),
+    Quantity0 = direct_get(<<"quantity">>, Req),
+    case {Recipient, parse_positive_quantity(Quantity0)} of
+        {undefined, _} ->
+            withdraw_error(400, <<"Missing AO payment auto-withdraw recipient.">>);
+        {_, {error, _}} ->
+            withdraw_error(400, <<"Invalid AO payment auto-withdraw quantity.">>);
+        {_, {ok, Quantity}} ->
+            {ok, #{
+                <<"token">> => hb_util:human_id(Token),
+                <<"recipient">> => hb_util:human_id(Recipient),
+                <<"quantity">> => Quantity,
+                <<"withdraw-id">> =>
+                    auto_withdrawal_key(Req, Quantity, Recipient, NodeMsg),
+                <<"submit-url">> => submit_url(Base, NodeMsg)
+            }}
+    end.
+
+auto_withdrawal_key(Req, Quantity, Recipient, NodeMsg) ->
+    BaseKey =
+        try hb_message:id(Req, all, NodeMsg)
+        catch
+            _:_ ->
+                hb_util:encode(crypto:hash(sha256, term_to_binary(Req)))
+        end,
+    <<"p4:", BaseKey/binary, ":", (hb_util:bin(Quantity))/binary, ":",
+        (hb_util:human_id(Recipient))/binary>>.
+
 schedule_credit_notice(Payment, NodeMsg) ->
     Opts = wallet_opts(NodeMsg),
     Ledger = hb_maps:get(<<"ledger">>, Payment, undefined, NodeMsg),
@@ -538,6 +633,8 @@ read_ledger_balance_at(LedgerPath, Recipient, ResolveOpts) ->
     case hb_ao:resolve(#{ <<"path">> => BalancePath }, ResolveOpts) of
         {ok, Balance} ->
             normalize_balance(Balance);
+        {error, Reason} when Reason =:= not_found ->
+            {ok, 0};
         {error, Reason} ->
             payment_import_error(
                 503,
@@ -554,6 +651,8 @@ read_p4_ledger_balance_at(LedgerPath, Recipient, ResolveOpts) ->
             normalize_balance(hb_ao:get(Recipient, Balances, 0, ResolveOpts));
         {ok, Balance} ->
             normalize_balance(Balance);
+        {error, Reason} when Reason =:= not_found ->
+            {ok, 0};
         {error, Reason} ->
             payment_import_error(
                 503,
@@ -620,6 +719,12 @@ normalize_target(Target) when is_binary(Target) ->
 normalize_target(_) ->
     undefined.
 
+enabled(true) -> true;
+enabled(<<"true">>) -> true;
+enabled(1) -> true;
+enabled(<<"1">>) -> true;
+enabled(_) -> false.
+
 normalize_balance(Balance) ->
     try {ok, hb_util:int(Balance)}
     catch
@@ -665,34 +770,96 @@ annotate_last_seen(Error, {error, LastError}) ->
     Error#{ <<"last-error">> => format_reason(LastError) }.
 
 validate_withdrawal(Base, Req, NodeMsg) ->
-    ExpectedSecret = withdraw_secret(NodeMsg),
-    SuppliedSecret =
-        hb_ao:get(<<"withdraw-secret">>, Req, undefined, NodeMsg),
-    case ExpectedSecret of
-        undefined ->
-            withdraw_error(403, <<"AO payment withdrawals are not enabled.">>);
-        SuppliedSecret ->
-            validate_withdrawal_fields(Base, Req, NodeMsg);
-        _ ->
-            withdraw_error(403, <<"Invalid AO payment withdrawal secret.">>)
+    case authorize_withdrawal(Base, Req, NodeMsg) of
+        ok -> validate_withdrawal_fields(Base, Req, NodeMsg);
+        Error -> Error
     end.
 
+authorize_withdrawal(Base, Req, NodeMsg) ->
+    ExpectedSecret = withdraw_secret(NodeMsg),
+    SuppliedSecret = direct_get(<<"withdraw-secret">>, Req),
+    case ExpectedSecret of
+        SuppliedSecret when ExpectedSecret =/= undefined ->
+            ok;
+        _ ->
+            authorize_withdrawal_signer(Base, Req, NodeMsg)
+    end.
+
+authorize_withdrawal_signer(Base, Req, NodeMsg) ->
+    Allowed = withdraw_authorized_signers(Base, NodeMsg),
+    Signers = verified_message_signers(Req, NodeMsg),
+    case [Signer || Signer <- Signers, lists:member(Signer, Allowed)] of
+        [_ | _] ->
+            ok;
+        [] ->
+            withdraw_error(403, <<"AO payment withdrawal request is not signed by the operator.">>)
+    end.
+
+withdraw_authorized_signers(Base, NodeMsg) ->
+    lists:usort(
+        [
+            Signer
+         || Signer <- [
+                normalize_target(hb_maps:get(<<"settlement-account">>, Base, undefined, NodeMsg)),
+                normalize_target(hb_maps:get(<<"operator">>, Base, undefined, NodeMsg)),
+                normalize_target(hb_maps:get(<<"p4-recipient">>, Base, undefined, NodeMsg)),
+                normalize_target(hb_maps:get(<<"ao-payment-deposit-address">>, Base, undefined, NodeMsg)),
+                normalize_target(configured_value(<<"operator">>, operator, undefined, NodeMsg)),
+                normalize_target(configured_value(<<"p4-recipient">>, p4_recipient, undefined, NodeMsg)),
+                normalize_target(
+                    configured_value(
+                        <<"ao-payment-deposit-address">>,
+                        ao_payment_deposit_address,
+                        undefined,
+                        NodeMsg
+                    )
+                )
+            ],
+            Signer =/= undefined
+        ]
+    ).
+
+verified_message_signers(Msg, NodeMsg) ->
+    case has_commitments(Msg) of
+        true -> verified_message_signers_1(Msg, NodeMsg);
+        false -> []
+    end.
+
+verified_message_signers_1(Msg, NodeMsg) ->
+    try hb_message:verify(Msg, signers, NodeMsg) of
+        true ->
+            [
+                Signer
+             || Signer0 <- message_signers(Msg, NodeMsg),
+                Signer <- [normalize_target(Signer0)],
+                Signer =/= undefined
+            ];
+        _ -> []
+    catch
+        _:_ -> []
+    end.
+
+has_commitments(Msg) when is_map(Msg) ->
+    case direct_get(<<"commitments">>, Msg) of
+        Commitments when is_map(Commitments) -> map_size(Commitments) > 0;
+        Commitments when is_list(Commitments) -> Commitments =/= [];
+        _ -> false
+    end;
+has_commitments(_) ->
+    false.
+
 validate_withdrawal_fields(Base, Req, NodeMsg) ->
-    Token =
-        hb_ao:get(
+    TokenDefault =
+        hb_maps:get(
             <<"token">>,
-            Req,
-            hb_maps:get(
-                <<"token">>,
-                Base,
-                hb_opts:get(ao_payment_token, ?DEFAULT_AO_TOKEN, NodeMsg),
-                NodeMsg
-            ),
+            Base,
+            hb_opts:get(ao_payment_token, ?DEFAULT_AO_TOKEN, NodeMsg),
             NodeMsg
         ),
-    Recipient = hb_ao:get(<<"recipient">>, Req, undefined, NodeMsg),
-    Quantity0 = hb_ao:get(<<"quantity">>, Req, undefined, NodeMsg),
-    WithdrawID = hb_ao:get(<<"withdraw-id">>, Req, undefined, NodeMsg),
+    Token = request_value(<<"token">>, Req, TokenDefault),
+    Recipient = direct_get(<<"recipient">>, Req),
+    Quantity0 = direct_get(<<"quantity">>, Req),
+    WithdrawID = direct_get(<<"withdraw-id">>, Req),
     case {Recipient, parse_positive_quantity(Quantity0)} of
         {undefined, _} ->
             withdraw_error(400, <<"Missing withdrawal recipient.">>);
@@ -859,7 +1026,7 @@ withdraw_fetch_error(Reason) ->
 
 wallet_opts(NodeMsg) ->
     Wallet =
-        case hb_opts:get(priv_wallet, not_found, NodeMsg) of
+        case configured_wallet(NodeMsg) of
             not_found ->
                 hb:wallet(hb_opts:get(priv_key_location, <<"hyperbeam-key.json">>, NodeMsg));
             FoundWallet ->
@@ -872,6 +1039,14 @@ wallet_opts(NodeMsg) ->
         operator => Operator,
         <<"operator">> => Operator
     }.
+
+configured_wallet(Opts) when is_map(Opts) ->
+    case maps:get(<<"priv-wallet">>, Opts, not_found) of
+        not_found -> maps:get(priv_wallet, Opts, not_found);
+        Wallet -> Wallet
+    end;
+configured_wallet(_Opts) ->
+    not_found.
 
 local_node(NodeMsg) ->
     hb_opts:get(
@@ -1141,6 +1316,22 @@ p4_charge_missing_ledger_path_test() ->
         charge(#{}, #{}, #{})
     ).
 
+p4_auto_withdrawal_uses_configured_recipient_test() ->
+    Token = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Recipient = hb_util:encode(crypto:strong_rand_bytes(32)),
+    NodeMsg = #{
+        <<"ao-payment-auto-withdraw">> => true,
+        <<"ao-payment-token">> => Token,
+        <<"ao-payment-withdraw-recipient">> => Recipient
+    },
+    Req = #{ <<"quantity">> => 7, <<"account">> => <<"payer">> },
+    ?assertEqual(true, auto_withdraw_enabled(#{}, NodeMsg)),
+    {ok, Withdrawal} = auto_withdrawal_from_charge(#{}, Req, NodeMsg),
+    ?assertEqual(Token, maps:get(<<"token">>, Withdrawal)),
+    ?assertEqual(Recipient, maps:get(<<"recipient">>, Withdrawal)),
+    ?assertEqual(7, maps:get(<<"quantity">>, Withdrawal)),
+    ?assertMatch(<<"p4:", _/binary>>, maps:get(<<"withdraw-id">>, Withdrawal)).
+
 p4_balance_target_uses_nested_request_target_test() ->
     ?assertEqual(
         <<"alice">>,
@@ -1160,6 +1351,85 @@ settlement_config_defaults_and_overrides_test() ->
     ?assertEqual(
         25,
         settlement_poll_ms(#{ ao_payment_settlement_poll_ms => 25 })
+    ).
+
+withdraw_accepts_private_secret_test() ->
+    NodeMsg =
+        hb_private:set(
+            #{},
+            <<"ao-payment-withdraw-secret">>,
+            <<"secret">>,
+            #{}
+        ),
+    ?assertMatch(
+        {ok, #{ <<"quantity">> := 7 }},
+        validate_withdrawal(
+            #{},
+            #{
+                <<"recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+                <<"quantity">> => <<"7">>,
+                <<"withdraw-secret">> => <<"secret">>
+            },
+            NodeMsg
+        )
+    ).
+
+withdraw_rejects_unsigned_request_test() ->
+    Operator = hb_util:encode(crypto:strong_rand_bytes(32)),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        validate_withdrawal(
+            #{},
+            #{
+                <<"recipient">> => Operator,
+                <<"quantity">> => <<"7">>
+            },
+            #{ <<"operator">> => Operator }
+        )
+    ).
+
+withdraw_accepts_operator_signed_request_test() ->
+    Wallet = ar_wallet:new(),
+    Operator = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    NodeMsg = #{
+        priv_wallet => Wallet,
+        <<"priv-wallet">> => Wallet,
+        <<"operator">> => Operator
+    },
+    Req =
+        hb_message:commit(
+            #{
+                <<"recipient">> => Operator,
+                <<"quantity">> => <<"7">>,
+                <<"withdraw-id">> => <<"signed-withdrawal">>
+            },
+            NodeMsg
+        ),
+    ?assertMatch(
+        {ok, #{ <<"quantity">> := 7 }},
+        validate_withdrawal(#{}, Req, NodeMsg)
+    ).
+
+withdraw_rejects_non_operator_signed_request_test() ->
+    Wallet = ar_wallet:new(),
+    Operator = hb_util:encode(crypto:strong_rand_bytes(32)),
+    NodeMsg = #{
+        priv_wallet => Wallet,
+        <<"priv-wallet">> => Wallet,
+        <<"operator">> => Operator
+    },
+    Req =
+        hb_message:commit(
+            #{
+                <<"recipient">> => Operator,
+                <<"quantity">> => <<"7">>,
+                <<"withdraw-id">> => <<"signed-withdrawal">>
+            },
+            NodeMsg
+        ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        validate_withdrawal(#{}, Req, NodeMsg)
     ).
 
 withdraw_posts_legacy_mu_test_() ->
