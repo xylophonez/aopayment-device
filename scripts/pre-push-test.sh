@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HB_REF="4177b91993b2f590f4906bc9ca548724f8408875"
+HB_REF="178fec98d8f5ac3843534752d1047a8bed51df06"
 HB_DIR="${AOPAYMENT_HYPERBEAM_DIR:-$ROOT/_build/hyperbeam-$HB_REF}"
-STORE="$ROOT/_build/hb4177-aopayment-preloaded-store"
+STORE="$ROOT/_build/hb178fec-aopayment-preloaded-store"
 FLOW_EBIN="$ROOT/_build/aopayment-flow-ebin"
 
 cd "$ROOT"

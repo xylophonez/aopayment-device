@@ -9,7 +9,7 @@ adapter shape by speaking p4's `balance` and `charge` calls directly.
 
 ## Compatibility
 
-- HyperBEAM pin: `4177b91993b2f590f4906bc9ca548724f8408875`
+- HyperBEAM pin: `178fec98d8f5ac3843534752d1047a8bed51df06`
 - Device name: `ao-payment@1.0`
 - Runtime ledger path: a local process route such as
   `/ledger~node-process@1.0`

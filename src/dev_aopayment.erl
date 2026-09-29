@@ -917,28 +917,27 @@ submit_withdrawal(Withdrawal, NodeMsg) ->
     Token = hb_maps:get(<<"token">>, Withdrawal, ?DEFAULT_AO_TOKEN, NodeMsg),
     Recipient = hb_maps:get(<<"recipient">>, Withdrawal, undefined, NodeMsg),
     Quantity = hb_maps:get(<<"quantity">>, Withdrawal, undefined, NodeMsg),
-    Msg =
-        hb_message:commit(
-            #{
-                <<"target">> => Token,
-                <<"data">> => <<"1984">>,
-                <<"Data-Protocol">> => <<"ao">>,
-                <<"Variant">> => <<"ao.TN.1">>,
-                <<"Type">> => <<"Message">>,
-                <<"Action">> => <<"Transfer">>,
-                <<"Recipient">> => Recipient,
-                <<"Quantity">> => hb_util:bin(Quantity),
-                <<"Content-Type">> => <<"text/plain">>,
-                <<"SDK">> => <<"hyperbeam-lapee">>
-            },
-            Opts,
-            <<"ans104@1.0">>
-        ),
-    MessageID = hb_message:id(Msg, signed, Opts),
+    Item = ar_bundles:sign_item(
+        #tx{
+            target = hb_util:decode(Token),
+            data = <<"1984">>,
+            tags = [
+                {<<"Data-Protocol">>, <<"ao">>},
+                {<<"Variant">>, <<"ao.TN.1">>},
+                {<<"Type">>, <<"Message">>},
+                {<<"Action">>, <<"Transfer">>},
+                {<<"Recipient">>, Recipient},
+                {<<"Quantity">>, hb_util:bin(Quantity)},
+                {<<"Content-Type">>, <<"text/plain">>},
+                {<<"SDK">>, <<"hyperbeam-lapee">>}
+            ]
+        },
+        maps:get(priv_wallet, Opts)
+    ),
+    MessageID = hb_util:human_id(Item#tx.id),
     case post_legacy_mu(
         hb_maps:get(<<"submit-url">>, Withdrawal, ?DEFAULT_SUBMIT_URL, NodeMsg),
-        Msg,
-        Opts
+        Item
     ) of
         {ok, SubmitResult} ->
             {ok, #{
@@ -952,9 +951,8 @@ submit_withdrawal(Withdrawal, NodeMsg) ->
             withdraw_fetch_error(Reason)
     end.
 
-post_legacy_mu(SubmitURL0, Msg, Opts) ->
+post_legacy_mu(SubmitURL0, Item) ->
     SubmitURL = normalize_url(SubmitURL0),
-    Item = hb_message:convert(Msg, <<"ans104@1.0">>, Opts),
     Body = ar_bundles:serialize(Item),
     application:ensure_all_started(inets),
     application:ensure_all_started(ssl),
@@ -1478,6 +1476,9 @@ withdraw_posts_legacy_mu_test_() ->
                 ar_bundles:deserialize(
                     hb_maps:get(<<"body">>, Captured, undefined, #{})
                 ),
+            ?assert(ar_bundles:verify_item(RawTX)),
+            ?assertEqual(hb_util:decode(Token), RawTX#tx.target),
+            ?assertEqual(<<"1984">>, RawTX#tx.data),
             RawTags = RawTX#tx.tags,
             ?assert(lists:member({<<"Data-Protocol">>, <<"ao">>}, RawTags)),
             ?assert(lists:member({<<"Variant">>, <<"ao.TN.1">>}, RawTags)),
@@ -1485,25 +1486,8 @@ withdraw_posts_legacy_mu_test_() ->
             ?assert(lists:member({<<"Action">>, <<"Transfer">>}, RawTags)),
             ?assert(lists:member({<<"Recipient">>, Recipient}, RawTags)),
             ?assert(lists:member({<<"Quantity">>, <<"7">>}, RawTags)),
-            Submitted =
-                hb_message:convert(
-                    ar_bundles:deserialize(
-                        hb_maps:get(<<"body">>, Captured, undefined, #{})
-                    ),
-                    <<"structured@1.0">>,
-                    <<"ans104@1.0">>,
-                    NodeMsg
-                ),
-            ?assert(hb_message:verify(Submitted, all, NodeMsg)),
-            ?assertEqual(Token, hb_maps:get(<<"target">>, Submitted, undefined, NodeMsg)),
-            ?assertEqual(<<"ao">>, hb_maps:get(<<"data-protocol">>, Submitted, undefined, NodeMsg)),
-            ?assertEqual(<<"ao.TN.1">>, hb_maps:get(<<"variant">>, Submitted, undefined, NodeMsg)),
-            ?assertEqual(<<"Message">>, hb_maps:get(<<"type">>, Submitted, undefined, NodeMsg)),
-            ?assertEqual(<<"Transfer">>, hb_maps:get(<<"action">>, Submitted, undefined, NodeMsg)),
-            ?assertEqual(Recipient, hb_maps:get(<<"recipient">>, Submitted, undefined, NodeMsg)),
-            ?assertEqual(<<"7">>, hb_maps:get(<<"quantity">>, Submitted, undefined, NodeMsg)),
             ?assertEqual(
-                hb_message:id(Submitted, signed, NodeMsg),
+                hb_util:human_id(RawTX#tx.id),
                 hb_maps:get(<<"message-id">>, Result, undefined, NodeMsg)
             )
         after
