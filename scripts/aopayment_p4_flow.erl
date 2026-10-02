@@ -39,7 +39,10 @@ run() ->
                 <<"request">> => Processor,
                 <<"response">> => Processor
             },
-            <<"operator">> => OperatorAddress,
+            <<"operator">> => HostAddress,
+            <<"p4-recipient">> => OperatorAddress,
+            <<"ao-payment-ledger-path">> => LedgerPath,
+            <<"ao-payment-reservation-amount">> => 2,
             <<"node-processes">> => #{
                 LedgerName => #{
                     <<"device">> => <<"process@1.0">>,
@@ -92,6 +95,18 @@ run() ->
     {ok, Balances} = hb_http:get(Node, <<LedgerPath/binary, "/now/balance">>, #{}),
     assert_equal(48, hb_ao:get(BobAddress, Balances, #{}), bob_balance_after_charge),
     assert_equal(2, hb_ao:get(OperatorAddress, Balances, #{}), operator_receives_charge),
+    assert_match(
+        {error, '_'},
+        hb_http:get(Node, BobReq, #{}),
+        repeated_paid_request_is_not_reexecuted
+    ),
+    {ok, ReplayBalances} = hb_http:get(Node, <<LedgerPath/binary, "/now/balance">>, #{}),
+    assert_equal(48, hb_ao:get(BobAddress, ReplayBalances, #{}), replay_does_not_recharge),
+    assert_equal(
+        2,
+        hb_ao:get(OperatorAddress, ReplayBalances, #{}),
+        replay_does_not_recredit_operator
+    ),
     BobBalanceReq =
         hb_message:commit(
             #{<<"path">> => <<"/~p4@1.0/balance">>},

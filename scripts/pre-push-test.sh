@@ -12,8 +12,8 @@ cd "$ROOT"
 echo "==> standalone compile"
 rebar3 compile
 
-echo "==> standalone focused eunit"
-rebar3 eunit --test=dev_aopayment:p4_balance_missing_ledger_path_test+p4_balance_missing_target_returns_zero_test+p4_charge_missing_ledger_path_test+p4_balance_target_uses_nested_request_target_test
+echo "==> standalone device eunit"
+rebar3 eunit --module=dev_aopayment
 
 echo "==> package and verify"
 rebar3 device package
@@ -26,7 +26,9 @@ if [ ! -d "$HB_DIR/.git" ]; then
 fi
 
 echo "==> checkout HyperBEAM $HB_REF"
-git -C "$HB_DIR" fetch origin "$HB_REF"
+if ! git -C "$HB_DIR" cat-file -e "$HB_REF^{commit}" 2>/dev/null; then
+    git -C "$HB_DIR" fetch origin "$HB_REF"
+fi
 git -C "$HB_DIR" checkout --detach "$HB_REF"
 
 echo "==> compile HyperBEAM test profile"
@@ -39,7 +41,11 @@ PRELOAD_OUTPUT="$(
     rebar3 device preload --device-src "src/preloaded,$ROOT/src" --output-dir "$STORE"
 )"
 printf '%s\n' "$PRELOAD_OUTPUT"
-INDEX="$(printf '%s\n' "$PRELOAD_OUTPUT" | awk '/device preload: store/ {print $NF}' | tail -n 1)"
+INDEX="$(
+    printf '%s\n' "$PRELOAD_OUTPUT" |
+        sed -n 's/.*Index: \([^[:space:].]*\).*/\1/p' |
+        tail -n 1
+)"
 if [ -z "$INDEX" ]; then
     echo "could not parse preloaded index" >&2
     exit 1
@@ -60,6 +66,7 @@ erlc \
 echo "==> run p4 flow through preloaded ao-payment@1.0"
 export HB_PRELOADED_STORE="$STORE"
 export HB_PRELOADED_DEVICES_INDEX="$INDEX"
+export HB_PORT="${HB_PORT:-0}"
 (
     cd "$HB_DIR"
     erl \
