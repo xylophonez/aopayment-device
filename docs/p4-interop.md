@@ -7,8 +7,8 @@ trusted device whose only job was to sit between `p4@1.0` and the token ledger.
 This standalone package makes `ao-payment@1.0` implement the p4 ledger surface
 itself:
 
-- `balance/3` handles p4 balance checks;
-- `charge/3` handles p4 response charges;
+- `balance/3` handles p4 balance checks and durable admission reservations;
+- `charge/3` consumes a reservation exactly once for a p4 response charge;
 - `ledger-path` tells the device which local process ledger to read or push to.
 
 The important signer detail is that payer identity comes from the AO message
@@ -22,3 +22,21 @@ path: `p4@1.0` calls `ao-payment@1.0` by name from a Forge preloaded store, and
 `ao-payment@1.0` pushes charges into a real local `process@1.0` ledger running
 HyperBEAM's `hyper-token.lua` plus `hyper-token-p4.lua`.
 
+For metered inference, use two request hooks in this order: a `simple-pay@1.0`
+P4 hook whose offered route price equals `ao-payment-reservation-amount`, then a
+`metering@1.0` P4 hook. Use only the metering hook on the response. The first
+hook creates the reservation; it is an admission bound rather than a second
+charge.
+
+The node-level `ao-payment-ledger-path` and reservation amount are trusted.
+Values embedded in a device base/request cannot override them. Charge calls
+must be signed by an identity named in node configuration and target the
+configured P4 recipient.
+
+Before mutating the process ledger, `charge/3` stores the exact signed inner
+charge and both relevant balances in the reservation record. The pinned
+scheduler applies an identical signed inner message twice, so an interrupted
+retry never resubmits it. The device completes the record only when the
+expected debit and credit are visible; otherwise it fails closed with `503`.
+On a provider or pricing error, no response charge arrives and the reservation
+remains unavailable until its TTL expires.
