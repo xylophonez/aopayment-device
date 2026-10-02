@@ -90,8 +90,10 @@ withdraw(Base, Req, NodeMsg) ->
     case validate_withdrawal(Base, Req, NodeMsg) of
         {ok, Withdrawal} ->
             Key = withdrawal_key(Withdrawal),
-            Withdrawals = hb_opts:get(ao_payment_withdrawals, #{}, NodeMsg),
-            submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg);
+            with_withdrawal_lock(
+                Key,
+                fun() -> submit_and_store_withdrawal(Key, Withdrawal, NodeMsg) end
+            );
         Error ->
             Error
     end.
@@ -1336,26 +1338,159 @@ with_payment_lock(PaymentKey, Fun) ->
             Result
     end.
 
-submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg) ->
-    case maps:find(Key, Withdrawals) of
+submit_and_store_withdrawal(Key, Withdrawal, NodeMsg) ->
+    submit_and_store_withdrawal(
+        Key,
+        Withdrawal,
+        NodeMsg,
+        fun submit_prepared_withdrawal/2
+    ).
+
+submit_and_store_withdrawal(Key, Withdrawal, NodeMsg, SubmitFun) ->
+    case load_withdrawal(Key, NodeMsg) of
         {ok, Existing} ->
-            {ok, Existing#{ <<"status">> => <<"already-submitted">> }};
-        error ->
-            case submit_withdrawal(Withdrawal, NodeMsg) of
-                {ok, Result} ->
-                    Stored = Result#{ <<"status">> => <<"submitted">> },
-                    NewWithdrawals = Withdrawals#{ Key => Stored },
-                    hb_http_server:set_opts(
-                        #{},
-                        NodeMsg#{
-                            ao_payment_withdrawals => NewWithdrawals,
-                            <<"ao-payment-withdrawals">> => NewWithdrawals
-                        }
-                    ),
-                    {ok, Stored};
-                Error ->
-                    Error
+            existing_withdrawal_response(Existing, Withdrawal, NodeMsg);
+        not_found ->
+            Prepared = prepare_withdrawal(Withdrawal, NodeMsg),
+            case store_withdrawal(Key, Prepared, NodeMsg) of
+                ok ->
+                    complete_withdrawal_submission(
+                        Key,
+                        Prepared,
+                        NodeMsg,
+                        SubmitFun
+                    );
+                {error, Reason} ->
+                    payment_import_error(
+                        500,
+                        <<"Unable to persist AO withdrawal intent before submission.">>,
+                        Reason
+                    )
+            end;
+        {error, Reason} ->
+            payment_import_error(
+                500,
+                <<"Unable to read AO withdrawal state.">>,
+                Reason
+            )
+    end.
+
+complete_withdrawal_submission(Key, Prepared, NodeMsg, SubmitFun) ->
+    case SubmitFun(Prepared, NodeMsg) of
+        {ok, SubmitResult} ->
+            Submitted = Prepared#{
+                <<"status">> => <<"submitted">>,
+                <<"submitted-at">> => erlang:system_time(millisecond),
+                <<"submit-response">> => SubmitResult
+            },
+            case store_withdrawal(Key, Submitted, NodeMsg) of
+                ok ->
+                    {ok, withdrawal_response(Submitted)};
+                {error, Reason} ->
+                    payment_import_error(
+                        503,
+                        <<"AO withdrawal was submitted but its durable state could not be updated; automatic resubmission is disabled.">>,
+                        Reason
+                    )
+            end;
+        {error, Reason} ->
+            Uncertain = Prepared#{
+                <<"status">> => <<"uncertain">>,
+                <<"submit-error">> => format_reason(Reason)
+            },
+            _ = store_withdrawal(Key, Uncertain, NodeMsg),
+            uncertain_withdrawal_error(Uncertain, Reason)
+    end.
+
+existing_withdrawal_response(Existing, Withdrawal, NodeMsg) ->
+    case withdrawal_matches(Existing, Withdrawal, NodeMsg) of
+        false ->
+            withdraw_error(
+                409,
+                <<"AO withdrawal ID conflicts with an existing withdrawal intent.">>
+            );
+        true ->
+            case payment_status(Existing) of
+                <<"submitted">> ->
+                    {ok,
+                        (withdrawal_response(Existing))#{
+                            <<"status">> => <<"already-submitted">>
+                        }};
+                <<"already-submitted">> ->
+                    {ok, withdrawal_response(Existing)};
+                _ ->
+                    {error, #{
+                        <<"status">> => 503,
+                        <<"body">> =>
+                            <<"AO withdrawal outcome is uncertain; automatic resubmission is disabled.">>,
+                        <<"message-id">> =>
+                            hb_maps:get(<<"message-id">>, Existing, undefined, NodeMsg)
+                    }}
             end
+    end.
+
+withdrawal_matches(Existing, Withdrawal, NodeMsg) ->
+    try
+        normalize_target(hb_maps:get(<<"token">>, Existing, undefined, NodeMsg)) =:=
+            normalize_target(hb_maps:get(<<"token">>, Withdrawal, undefined, NodeMsg))
+            andalso normalize_target(
+                hb_maps:get(<<"recipient">>, Existing, undefined, NodeMsg)
+            ) =:= normalize_target(
+                hb_maps:get(<<"recipient">>, Withdrawal, undefined, NodeMsg)
+            )
+            andalso hb_util:int(
+                hb_maps:get(<<"quantity">>, Existing, undefined, NodeMsg)
+            ) =:= hb_util:int(
+                hb_maps:get(<<"quantity">>, Withdrawal, undefined, NodeMsg)
+            )
+    catch
+        _:_ -> false
+    end.
+
+withdrawal_response(Withdrawal) ->
+    maps:without([<<"signed-item">>], Withdrawal).
+
+load_withdrawal(Key, NodeMsg) ->
+    case persistent_state_read(withdrawal_path(Key), undefined, NodeMsg) of
+        {ok, undefined} ->
+            load_legacy_withdrawal(Key, NodeMsg);
+        {ok, Withdrawal} when is_map(Withdrawal) ->
+            {ok, Withdrawal};
+        {ok, _Invalid} ->
+            {error, invalid_withdrawal_state};
+        Error ->
+            Error
+    end.
+
+load_legacy_withdrawal(Key, NodeMsg) ->
+    Withdrawals = hb_opts:get(ao_payment_withdrawals, #{}, NodeMsg),
+    case maps:find(Key, Withdrawals) of
+        {ok, Withdrawal} when is_map(Withdrawal) ->
+            case store_withdrawal(Key, Withdrawal, NodeMsg) of
+                ok -> {ok, Withdrawal};
+                Error -> Error
+            end;
+        _ ->
+            not_found
+    end.
+
+store_withdrawal(Key, Withdrawal, NodeMsg) ->
+    persistent_state_write(withdrawal_path(Key), Withdrawal, NodeMsg).
+
+withdrawal_path(Key) ->
+    state_path(<<"withdrawals">>, Key).
+
+with_withdrawal_lock(Key, Fun) ->
+    Lock = {{?MODULE, node(), withdrawal, Key}, self()},
+    case global:trans(Lock, Fun) of
+        aborted ->
+            payment_import_error(
+                503,
+                <<"Unable to acquire AO withdrawal lock.">>,
+                withdrawal_lock_aborted
+            );
+        Result ->
+            Result
     end.
 
 auto_withdraw_enabled(_Base, NodeMsg) ->
@@ -1686,18 +1821,9 @@ withdraw_authorized_signers(_Base, NodeMsg) ->
     lists:usort(
         [
             Signer
-         || Signer <- [
-                normalize_target(configured_value(<<"operator">>, operator, undefined, NodeMsg)),
-                normalize_target(configured_value(<<"p4-recipient">>, p4_recipient, undefined, NodeMsg)),
-                normalize_target(
-                    configured_value(
-                        <<"ao-payment-deposit-address">>,
-                        ao_payment_deposit_address,
-                        undefined,
-                        NodeMsg
-                    )
-                )
-            ],
+         || Signer <- [normalize_target(
+                configured_value(<<"operator">>, operator, undefined, NodeMsg)
+            )],
             Signer =/= undefined
         ]
     ).
@@ -1765,34 +1891,47 @@ validate_withdrawal_fields(Base, Req, NodeMsg) ->
             ?DEFAULT_AO_TOKEN,
             NodeMsg
         ),
-    Token = request_value(<<"token">>, Req, TokenDefault),
     Recipient = direct_get(<<"recipient">>, Req),
     Quantity0 = direct_get(<<"quantity">>, Req),
     WithdrawID = direct_get(<<"withdraw-id">>, Req),
-    case {Recipient, parse_positive_quantity(Quantity0)} of
-        {undefined, _} ->
+    case {
+        request_scope_matches(<<"token">>, TokenDefault, Req),
+        Recipient,
+        parse_positive_quantity(Quantity0)
+    } of
+        {false, _, _} ->
+            withdraw_error(400, <<"Withdrawal token conflicts with node configuration.">>);
+        {true, undefined, _} ->
             withdraw_error(400, <<"Missing withdrawal recipient.">>);
-        {_, {error, _}} ->
+        {true, _, {error, _}} ->
             withdraw_error(400, <<"Invalid withdrawal quantity.">>);
-        {_, {ok, Quantity}} ->
+        {true, _, {ok, Quantity}} ->
             AllowedRecipient = allowed_withdraw_recipient(Base, NodeMsg),
-            case AllowedRecipient =:= undefined
-                orelse hb_util:human_id(AllowedRecipient) =:=
-                    hb_util:human_id(Recipient)
-            of
-                true ->
-                    {ok, #{
-                        <<"token">> => hb_util:human_id(Token),
-                        <<"recipient">> => hb_util:human_id(Recipient),
-                        <<"quantity">> => Quantity,
-                        <<"withdraw-id">> => WithdrawID,
-                        <<"submit-url">> => submit_url(Base, NodeMsg)
-                    }};
-                false ->
-                    withdraw_error(
-                        403,
-                        <<"Withdrawal recipient does not match configured beneficiary.">>
-                    )
+            case AllowedRecipient of
+                undefined ->
+                    payment_import_error(
+                        500,
+                        <<"AO withdrawal recipient is not configured.">>,
+                        missing_withdraw_recipient
+                    );
+                _ ->
+                    case hb_util:human_id(AllowedRecipient) =:=
+                        hb_util:human_id(Recipient)
+                    of
+                        true ->
+                            {ok, #{
+                                <<"token">> => hb_util:human_id(TokenDefault),
+                                <<"recipient">> => hb_util:human_id(Recipient),
+                                <<"quantity">> => Quantity,
+                                <<"withdraw-id">> => WithdrawID,
+                                <<"submit-url">> => submit_url(Base, NodeMsg)
+                            }};
+                        false ->
+                            withdraw_error(
+                                403,
+                                <<"Withdrawal recipient does not match configured beneficiary.">>
+                            )
+                    end
             end
     end.
 
@@ -1808,7 +1947,17 @@ allowed_withdraw_recipient(_Base, NodeMsg) ->
     configured_value(
         <<"ao-payment-withdraw-recipient">>,
         ao_payment_withdraw_recipient,
-        undefined,
+        configured_value(
+            <<"p4-recipient">>,
+            p4_recipient,
+            configured_value(
+                <<"ao-payment-deposit-address">>,
+                ao_payment_deposit_address,
+                undefined,
+                NodeMsg
+            ),
+            NodeMsg
+        ),
         NodeMsg
     ).
 
@@ -1822,7 +1971,7 @@ parse_positive_quantity(Quantity0) ->
         _:_ -> {error, invalid}
     end.
 
-submit_withdrawal(Withdrawal, NodeMsg) ->
+prepare_withdrawal(Withdrawal, NodeMsg) ->
     Opts = wallet_opts(NodeMsg),
     Token = hb_maps:get(<<"token">>, Withdrawal, ?DEFAULT_AO_TOKEN, NodeMsg),
     Recipient = hb_maps:get(<<"recipient">>, Withdrawal, undefined, NodeMsg),
@@ -1845,21 +1994,31 @@ submit_withdrawal(Withdrawal, NodeMsg) ->
         maps:get(priv_wallet, Opts)
     ),
     MessageID = hb_util:human_id(Item#tx.id),
+    Withdrawal#{
+        <<"status">> => <<"prepared">>,
+        <<"message-id">> => MessageID,
+        <<"signed-item">> => Item,
+        <<"prepared-at">> => erlang:system_time(millisecond)
+    }.
+
+submit_prepared_withdrawal(Prepared, NodeMsg) ->
+    Item = hb_maps:get(<<"signed-item">>, Prepared, undefined, NodeMsg),
     case post_legacy_mu(
-        hb_maps:get(<<"submit-url">>, Withdrawal, ?DEFAULT_SUBMIT_URL, NodeMsg),
+        hb_maps:get(<<"submit-url">>, Prepared, ?DEFAULT_SUBMIT_URL, NodeMsg),
         Item
     ) of
-        {ok, SubmitResult} ->
-            {ok, #{
-                <<"message-id">> => MessageID,
-                <<"token">> => Token,
-                <<"recipient">> => Recipient,
-                <<"quantity">> => Quantity,
-                <<"submit-response">> => SubmitResult
-            }};
-        {error, Reason} ->
-            withdraw_fetch_error(Reason)
+        {ok, SubmitResult} -> {ok, SubmitResult};
+        Error -> Error
     end.
+
+uncertain_withdrawal_error(Prepared, Reason) ->
+    {error, #{
+        <<"status">> => 503,
+        <<"body">> =>
+            <<"AO withdrawal submission outcome is uncertain; automatic resubmission is disabled.">>,
+        <<"message-id">> => hb_maps:get(<<"message-id">>, Prepared, undefined, #{}),
+        <<"reason">> => format_reason(Reason)
+    }}.
 
 post_legacy_mu(SubmitURL0, Item) ->
     SubmitURL = normalize_url(SubmitURL0),
@@ -1923,13 +2082,6 @@ withdrawal_key(Withdrawal) ->
 
 withdraw_error(Status, Body) ->
     {error, #{ <<"status">> => Status, <<"body">> => Body }}.
-
-withdraw_fetch_error(Reason) ->
-    {error, #{
-        <<"status">> => 502,
-        <<"body">> => <<"Unable to submit AO withdrawal to AO endpoint.">>,
-        <<"reason">> => format_reason(Reason)
-    }}.
 
 wallet_opts(NodeMsg) ->
     Wallet =
@@ -2426,9 +2578,10 @@ settlement_config_defaults_and_overrides_test() ->
     ).
 
 withdraw_accepts_private_secret_test() ->
+    Recipient = hb_util:encode(crypto:strong_rand_bytes(32)),
     NodeMsg =
         hb_private:set(
-            #{},
+            #{ <<"p4-recipient">> => Recipient },
             <<"ao-payment-withdraw-secret">>,
             <<"secret">>,
             #{}
@@ -2438,7 +2591,7 @@ withdraw_accepts_private_secret_test() ->
         validate_withdrawal(
             #{},
             #{
-                <<"recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+                <<"recipient">> => Recipient,
                 <<"quantity">> => <<"7">>,
                 <<"withdraw-secret">> => <<"secret">>
             },
@@ -2466,7 +2619,8 @@ withdraw_accepts_operator_signed_request_test() ->
     NodeMsg = #{
         priv_wallet => Wallet,
         <<"priv-wallet">> => Wallet,
-        <<"operator">> => Operator
+        <<"operator">> => Operator,
+        <<"p4-recipient">> => Operator
     },
     Req =
         hb_message:commit(
@@ -2504,6 +2658,170 @@ withdraw_rejects_non_operator_signed_request_test() ->
         validate_withdrawal(#{}, Req, NodeMsg)
     ).
 
+withdraw_rejects_beneficiary_signer_destination_and_token_override_test() ->
+    OperatorWallet = ar_wallet:new(),
+    BeneficiaryWallet = ar_wallet:new(),
+    Operator = hb_util:human_id(ar_wallet:to_address(OperatorWallet)),
+    Beneficiary = hb_util:human_id(ar_wallet:to_address(BeneficiaryWallet)),
+    OtherRecipient = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Token = hb_util:encode(crypto:strong_rand_bytes(32)),
+    NodeMsg = #{
+        priv_wallet => OperatorWallet,
+        <<"priv-wallet">> => OperatorWallet,
+        <<"operator">> => Operator,
+        <<"p4-recipient">> => Beneficiary,
+        <<"ao-payment-deposit-address">> => Beneficiary,
+        <<"ao-payment-token">> => Token
+    },
+    Request = #{
+        <<"recipient">> => Beneficiary,
+        <<"quantity">> => 7,
+        <<"withdraw-id">> => <<"guarded-withdrawal">>
+    },
+    BeneficiarySigned = hb_message:commit(
+        Request,
+        #{ <<"priv-wallet">> => BeneficiaryWallet }
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        validate_withdrawal(#{}, BeneficiarySigned, NodeMsg)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        validate_withdrawal(
+            #{},
+            hb_message:commit(
+                Request#{ <<"recipient">> => OtherRecipient },
+                #{ <<"priv-wallet">> => OperatorWallet }
+            ),
+            NodeMsg
+        )
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        validate_withdrawal(
+            #{},
+            hb_message:commit(
+                Request#{
+                    <<"token">> => hb_util:encode(crypto:strong_rand_bytes(32))
+                },
+                #{ <<"priv-wallet">> => OperatorWallet }
+            ),
+            NodeMsg
+        )
+    ),
+    ?assertMatch(
+        {ok, #{ <<"recipient">> := Beneficiary, <<"token">> := Token }},
+        validate_withdrawal(
+            #{},
+            hb_message:commit(Request, #{ <<"priv-wallet">> => OperatorWallet }),
+            NodeMsg
+        )
+    ).
+
+withdrawal_state_serializes_and_persists_single_submission_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ao-payment-withdrawals">>),
+    hb_store:start(Store),
+    Wallet = ar_wallet:new(),
+    Withdrawal = #{
+        <<"token">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"quantity">> => 7,
+        <<"withdraw-id">> => <<"single-submit">>,
+        <<"submit-url">> => <<"https://mu.invalid">>
+    },
+    Opts = #{
+        store => Store,
+        <<"store">> => Store,
+        priv_wallet => Wallet,
+        <<"priv-wallet">> => Wallet
+    },
+    Key = withdrawal_key(Withdrawal),
+    Counter = atomics:new(1, []),
+    SubmitFun = fun(_Prepared, _NodeMsg) ->
+        _ = atomics:add_get(Counter, 1, 1),
+        timer:sleep(25),
+        {ok, #{ <<"status">> => 202 }}
+    end,
+    Parent = self(),
+    Ref = make_ref(),
+    [
+        spawn(fun() ->
+            Result = with_withdrawal_lock(
+                Key,
+                fun() ->
+                    submit_and_store_withdrawal(
+                        Key,
+                        Withdrawal,
+                        Opts,
+                        SubmitFun
+                    )
+                end
+            ),
+            Parent ! {Ref, Result}
+        end)
+     || _ <- lists:seq(1, 4)
+    ],
+    Results = [receive {Ref, Result} -> Result end || _ <- lists:seq(1, 4)],
+    ?assertEqual(1, atomics:get(Counter, 1)),
+    ?assertEqual(
+        1,
+        length([
+            ok
+         || {ok, #{ <<"status">> := <<"submitted">> }} <- Results
+        ])
+    ),
+    ?assertEqual(
+        3,
+        length([
+            ok
+         || {ok, #{ <<"status">> := <<"already-submitted">> }} <- Results
+        ])
+    ),
+    {ok, Persisted} = load_withdrawal(Key, Opts),
+    ?assertEqual(<<"submitted">>, maps:get(<<"status">>, Persisted)),
+    ?assertMatch(
+        {error, #{ <<"status">> := 409 }},
+        submit_and_store_withdrawal(
+            Key,
+            Withdrawal#{ <<"quantity">> => 8 },
+            Opts,
+            SubmitFun
+        )
+    ),
+    ?assertEqual(1, atomics:get(Counter, 1)).
+
+prepared_withdrawal_is_never_resubmitted_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ao-payment-withdrawal-retry">>),
+    hb_store:start(Store),
+    Wallet = ar_wallet:new(),
+    Withdrawal = #{
+        <<"token">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"quantity">> => 7,
+        <<"withdraw-id">> => <<"prepared-withdrawal">>,
+        <<"submit-url">> => <<"https://mu.invalid">>
+    },
+    Opts = #{
+        store => Store,
+        <<"store">> => Store,
+        priv_wallet => Wallet,
+        <<"priv-wallet">> => Wallet
+    },
+    Key = withdrawal_key(Withdrawal),
+    Prepared = prepare_withdrawal(Withdrawal, Opts),
+    ok = store_withdrawal(Key, Prepared, Opts),
+    Counter = atomics:new(1, []),
+    SubmitFun = fun(_PreparedAgain, _NodeMsg) ->
+        _ = atomics:add_get(Counter, 1, 1),
+        {ok, #{ <<"status">> => 202 }}
+    end,
+    ?assertMatch(
+        {error, #{ <<"status">> := 503 }},
+        submit_and_store_withdrawal(Key, Withdrawal, Opts, SubmitFun)
+    ),
+    ?assertEqual(0, atomics:get(Counter, 1)).
+
 withdraw_posts_legacy_mu_test_() ->
     {timeout, 30, fun() ->
         {ok, _} = application:ensure_all_started(hackney),
@@ -2529,17 +2847,23 @@ withdraw_posts_legacy_mu_test_() ->
             ]),
         NodeMsg = Opts0,
         try
-            {ok, Result} =
-                submit_withdrawal(
-                    #{
-                        <<"token">> => Token,
-                        <<"recipient">> => Recipient,
-                        <<"quantity">> => 7,
-                        <<"withdraw-id">> => <<"test-withdrawal">>,
-                        <<"submit-url">> => SubmitURL
-                    },
-                    NodeMsg
-                ),
+            Prepared = prepare_withdrawal(
+                #{
+                    <<"token">> => Token,
+                    <<"recipient">> => Recipient,
+                    <<"quantity">> => 7,
+                    <<"withdraw-id">> => <<"test-withdrawal">>,
+                    <<"submit-url">> => SubmitURL
+                },
+                NodeMsg
+            ),
+            {ok, SubmitResult} = submit_prepared_withdrawal(Prepared, NodeMsg),
+            Result = withdrawal_response(
+                Prepared#{
+                    <<"status">> => <<"submitted">>,
+                    <<"submit-response">> => SubmitResult
+                }
+            ),
             [Captured] = hb_mock_server:get_requests(submit, 1, MockHandle),
             Headers = hb_maps:get(<<"headers">>, Captured, #{}, #{}),
             ?assertEqual(
