@@ -21,46 +21,65 @@
 -define(HTTP_TIMEOUT_MS, 30000).
 -define(DEFAULT_SETTLEMENT_TIMEOUT_MS, 300000).
 -define(DEFAULT_SETTLEMENT_POLL_MS, 3000).
+-define(DEFAULT_RESERVATION_TTL_MS, 3600000).
+-define(LEDGER_READ_ATTEMPTS, 3).
+-define(LEDGER_READ_RETRY_MS, 10).
+-define(STATE_TERM_TAG, dev_aopayment_state_v1).
 
 %% @doc Verify and import an AO token payment into the local ledger.
 ingest(Base, Req, NodeMsg) ->
     case verify(Base, Req, NodeMsg) of
         {ok, Payment} ->
             PaymentKey = payment_key(Payment),
-            Imports = hb_opts:get(ao_payment_imports, #{}, NodeMsg),
-            case maps:find(PaymentKey, Imports) of
-                {ok, Existing} ->
-                    case payment_status(Existing) of
-                        <<"scheduled">> ->
-                            settle_import(PaymentKey, Existing, Imports, NodeMsg);
-                        <<"imported">> ->
-                            {ok, Existing#{ <<"status">> => <<"already-imported">> }};
-                        <<"already-imported">> ->
-                            {ok, Existing};
-                        _ ->
-                            {ok, Existing#{ <<"status">> => <<"already-imported">> }}
-                    end;
-                error ->
-                    case schedule_payment_import(Payment, NodeMsg) of
-                        {ok, PendingPayment} ->
-                            PendingImports = store_import(
-                                PaymentKey,
-                                PendingPayment,
-                                Imports,
-                                NodeMsg
-                            ),
-                            settle_import(
-                                PaymentKey,
-                                PendingPayment,
-                                PendingImports,
-                                NodeMsg
-                            );
-                        Error ->
-                            Error
-                    end
-            end;
+            with_payment_lock(
+                PaymentKey,
+                fun() -> ingest_verified_payment(PaymentKey, Payment, NodeMsg) end
+            );
         Error ->
             Error
+    end.
+
+ingest_verified_payment(PaymentKey, Payment, NodeMsg) ->
+    case load_import(PaymentKey, NodeMsg) of
+        {ok, Existing} ->
+            case payment_status(Existing) of
+                <<"prepared">> ->
+                    settle_import(PaymentKey, Existing, NodeMsg);
+                <<"scheduled">> ->
+                    settle_import(PaymentKey, Existing, NodeMsg);
+                <<"imported">> ->
+                    {ok, Existing#{ <<"status">> => <<"already-imported">> }};
+                <<"already-imported">> ->
+                    {ok, Existing};
+                _ ->
+                    {ok, Existing#{ <<"status">> => <<"already-imported">> }}
+            end;
+        not_found ->
+            case prepare_payment_import(Payment, NodeMsg) of
+                {ok, PendingPayment} ->
+                    case store_import(PaymentKey, PendingPayment, NodeMsg) of
+                        ok ->
+                            schedule_new_import(
+                                PaymentKey,
+                                PendingPayment,
+                                NodeMsg
+                            );
+                        {error, Reason} ->
+                            payment_import_error(
+                                500,
+                                <<"Unable to persist AO payment import before scheduling.">>,
+                                Reason
+                            )
+                    end;
+                Error ->
+                    Error
+            end;
+        {error, Reason} ->
+            payment_import_error(
+                500,
+                <<"Unable to read AO payment import state.">>,
+                Reason
+            )
     end.
 
 %% @doc Submit a real AO transfer from the node wallet to the configured
@@ -90,7 +109,7 @@ balance(Base, Req, NodeMsg) ->
         {_, undefined} ->
             {ok, 0};
         {LedgerPath, Target} ->
-            read_p4_ledger_balance_at(LedgerPath, Target, ledger_resolve_opts(NodeMsg))
+            balance_with_reservation(Base, LedgerPath, Target, Req, NodeMsg)
     end.
 
 %% @doc P4 ledger API: apply a node-signed p4 charge to the local AO payment
@@ -104,56 +123,758 @@ charge(Base, Req, NodeMsg) ->
                 missing_ledger_path
             );
         LedgerPath ->
-            LedgerRoute = normalize_route(LedgerPath),
-            LedgerOpts = ledger_resolve_opts(NodeMsg),
-            case hb_ao:resolve(
-                #{
-                    <<"path">> => <<"(", LedgerRoute/binary, ")/push">>,
-                    <<"method">> => <<"POST">>,
-                    <<"body">> => Req
-                },
-                LedgerOpts
-            ) of
-                {ok, Result} ->
-                    case auto_withdraw_after_charge(Base, Req, NodeMsg) of
-                        {ok, _WithdrawalResult} -> {ok, Result};
-                        {error, Error} -> {error, Error}
-                    end;
+            case validate_charge_request(Base, Req, NodeMsg) of
+                {ok, Account, Recipient, Quantity} ->
+                    with_account_lock(
+                        LedgerPath,
+                        Account,
+                        fun() ->
+                            charge_locked(
+                                Base,
+                                Req,
+                                LedgerPath,
+                                Account,
+                                Recipient,
+                                Quantity,
+                                NodeMsg
+                            )
+                        end
+                    );
                 Error ->
                     Error
             end
     end.
 
+charge_locked(Base, Req, LedgerPath, Account, Recipient, Quantity, NodeMsg) ->
+    LedgerOpts = ledger_resolve_opts(NodeMsg),
+    Request = direct_get(<<"request">>, Req),
+    ReservationKey = request_key(Request, NodeMsg),
+    case reservation_for(Account, ReservationKey, NodeMsg) of
+        {error, _} = Error ->
+            Error;
+        {ok, Reservation, ReservationState} ->
+            Reserved = hb_maps:get(<<"amount">>, Reservation, 0, NodeMsg),
+            case Quantity =< Reserved of
+                false ->
+                    {error, #{
+                        <<"status">> => 402,
+                        <<"body">> => <<"Measured charge exceeds the reserved maximum.">>,
+                        <<"price">> => Quantity,
+                        <<"reserved">> => Reserved
+                    }};
+                true ->
+                    charge_sufficient_balance(
+                        Base,
+                        Req,
+                        LedgerPath,
+                        Account,
+                        Recipient,
+                        Quantity,
+                        ReservationKey,
+                        ReservationState,
+                        LedgerOpts,
+                        NodeMsg
+                    )
+            end;
+        {terminal, #{ <<"status">> := <<"charged">> } = Reservation, _State} ->
+            case prepared_charge_matches(Reservation, Req, Account, Quantity, NodeMsg) of
+                true ->
+                    {ok, #{
+                        <<"status">> => <<"already-charged">>,
+                        <<"quantity">> => Quantity
+                    }};
+                false ->
+                    withdraw_error(
+                        409,
+                        <<"AO payment charge conflicts with the completed reservation.">>
+                    )
+            end;
+        {terminal, #{ <<"status">> := <<"charging">> } = Reservation, State} ->
+            resume_prepared_charge(
+                Req,
+                LedgerPath,
+                Account,
+                Recipient,
+                Quantity,
+                ReservationKey,
+                Reservation,
+                State,
+                NodeMsg
+            );
+        {terminal, #{ <<"status">> := <<"released">> }, _State} ->
+            withdraw_error(409, <<"AO payment reservation was already released.">>);
+        not_found ->
+            case reservation_amount(Base, NodeMsg) > 0 of
+                true ->
+                    withdraw_error(402, <<"AO payment charge has no active reservation.">>);
+                false ->
+                    charge_sufficient_balance(
+                        Base,
+                        Req,
+                        LedgerPath,
+                        Account,
+                        Recipient,
+                        Quantity,
+                        undefined,
+                        undefined,
+                        LedgerOpts,
+                        NodeMsg
+                    )
+            end
+    end.
+
+charge_sufficient_balance(
+    Base,
+    Req,
+    LedgerPath,
+    Account,
+    Recipient,
+    Quantity,
+    ReservationKey,
+    ReservationState,
+    LedgerOpts,
+    NodeMsg
+) ->
+    case read_p4_ledger_balance_at(LedgerPath, Account, LedgerOpts) of
+        {ok, PayerBalance} when PayerBalance >= Quantity ->
+            apply_reserved_charge(
+                Base,
+                Req,
+                LedgerPath,
+                Account,
+                Recipient,
+                Quantity,
+                ReservationKey,
+                ReservationState,
+                LedgerOpts,
+                PayerBalance,
+                NodeMsg
+            );
+        {ok, Balance} ->
+            {error, #{
+                <<"status">> => 402,
+                <<"body">> => <<"Insufficient funds">>,
+                <<"balance">> => Balance,
+                <<"price">> => Quantity
+            }};
+        Error ->
+            Error
+    end.
+
+apply_reserved_charge(
+    Base,
+    Req,
+    LedgerPath,
+    _Account,
+    _Recipient,
+    _Quantity,
+    undefined,
+    _ReservationState,
+    _LedgerOpts,
+    _PayerBalance,
+    NodeMsg
+) ->
+    apply_charge(Base, Req, LedgerPath, NodeMsg);
+apply_reserved_charge(
+    Base,
+    Req,
+    LedgerPath,
+    Account,
+    Recipient,
+    Quantity,
+    ReservationKey,
+    ReservationState,
+    LedgerOpts,
+    PayerBalance,
+    NodeMsg
+) ->
+    case read_p4_ledger_balance_at(LedgerPath, Recipient, LedgerOpts) of
+        {ok, RecipientBalance} ->
+            LedgerCharge = ledger_charge_request(Req, NodeMsg),
+            case mark_reservation_charging(
+                Account,
+                Recipient,
+                Quantity,
+                ReservationKey,
+                LedgerCharge,
+                PayerBalance,
+                RecipientBalance,
+                ReservationState,
+                NodeMsg
+            ) of
+                {ok, ChargingState} ->
+                    complete_prepared_charge(
+                        Base,
+                        LedgerPath,
+                        Account,
+                        Quantity,
+                        ReservationKey,
+                        LedgerCharge,
+                        ChargingState,
+                        NodeMsg
+                    );
+                {error, Reason} ->
+                    payment_import_error(
+                        500,
+                        <<"Unable to persist AO payment charge intent.">>,
+                        Reason
+                    )
+            end;
+        Error ->
+            Error
+    end.
+
+resume_prepared_charge(
+    Req,
+    LedgerPath,
+    Account,
+    Recipient,
+    Quantity,
+    ReservationKey,
+    Reservation,
+    State,
+    NodeMsg
+) ->
+    case prepared_charge_matches(Reservation, Req, Account, Quantity, NodeMsg) of
+        true ->
+            reconcile_prepared_charge(
+                LedgerPath,
+                Account,
+                Recipient,
+                Quantity,
+                ReservationKey,
+                Reservation,
+                State,
+                NodeMsg
+            );
+        false ->
+            withdraw_error(
+                409,
+                <<"AO payment charge conflicts with the in-flight reservation.">>
+            )
+    end.
+
+reconcile_prepared_charge(
+    LedgerPath,
+    Account,
+    Recipient,
+    Quantity,
+    ReservationKey,
+    Reservation,
+    State,
+    NodeMsg
+) ->
+    LedgerOpts = ledger_resolve_opts(NodeMsg),
+    case read_p4_ledger_balance_at(LedgerPath, Account, LedgerOpts) of
+        {ok, PayerBalance} ->
+            case read_p4_ledger_balance_at(LedgerPath, Recipient, LedgerOpts) of
+                {ok, RecipientBalance} ->
+                    case charge_was_applied(
+                        Account,
+                        Recipient,
+                        Quantity,
+                        PayerBalance,
+                        RecipientBalance,
+                        Reservation,
+                        NodeMsg
+                    ) of
+                        true ->
+                            case consume_reservation(
+                                Account,
+                                ReservationKey,
+                                Quantity,
+                                State,
+                                NodeMsg
+                            ) of
+                                ok ->
+                                    {ok, #{
+                                        <<"status">> => <<"already-charged">>,
+                                        <<"quantity">> => Quantity
+                                    }};
+                                {error, Reason} ->
+                                    payment_import_error(
+                                        500,
+                                        <<"Reconciled charge state could not be committed.">>,
+                                        Reason
+                                    )
+                            end;
+                        false ->
+                            {error, #{
+                                <<"status">> => 503,
+                                <<"body">> =>
+                                    <<"AO payment charge outcome is uncertain; automatic resubmission is disabled.">>,
+                                <<"payer-balance">> => PayerBalance,
+                                <<"recipient-balance">> => RecipientBalance
+                            }}
+                    end;
+                Error ->
+                    Error
+            end;
+        Error ->
+            Error
+    end.
+
+charge_was_applied(
+    Account,
+    Recipient,
+    Quantity,
+    PayerBalance,
+    RecipientBalance,
+    Reservation,
+    NodeMsg
+) ->
+    BeforePayer = hb_maps:get(<<"payer-balance-before">>, Reservation, undefined, NodeMsg),
+    BeforeRecipient =
+        hb_maps:get(<<"recipient-balance-before">>, Reservation, undefined, NodeMsg),
+    Account =/= Recipient
+        andalso is_integer(BeforePayer)
+        andalso is_integer(BeforeRecipient)
+        andalso PayerBalance =:= BeforePayer - Quantity
+        andalso RecipientBalance >= BeforeRecipient + Quantity.
+
+prepared_charge_matches(Reservation, Req, Account, Quantity, NodeMsg) ->
+    LedgerCharge = hb_maps:get(
+        <<"ledger-charge">>,
+        Reservation,
+        undefined,
+        NodeMsg
+    ),
+    RequestedRecipient = normalize_target(direct_get(<<"recipient">>, Req)),
+    try
+        is_map(LedgerCharge)
+            andalso hb_util:int(
+                hb_maps:get(<<"quantity">>, Reservation, undefined, NodeMsg)
+            ) =:= Quantity
+            andalso normalize_target(direct_get(<<"account">>, LedgerCharge)) =:= Account
+            andalso normalize_target(direct_get(<<"recipient">>, LedgerCharge)) =:=
+                RequestedRecipient
+            andalso hb_util:int(direct_get(<<"quantity">>, LedgerCharge)) =:= Quantity
+    catch
+        _:_ -> false
+    end.
+
+complete_prepared_charge(
+    Base,
+    LedgerPath,
+    Account,
+    Quantity,
+    ReservationKey,
+    LedgerCharge,
+    State,
+    NodeMsg
+) ->
+    case apply_ledger_charge(Base, LedgerPath, LedgerCharge, NodeMsg) of
+        {ok, _} = Success ->
+            case consume_reservation(
+                Account,
+                ReservationKey,
+                Quantity,
+                State,
+                NodeMsg
+            ) of
+                ok -> Success;
+                {error, Reason} ->
+                    payment_import_error(
+                        500,
+                        <<"Charge succeeded but reservation state could not be committed.">>,
+                        Reason
+                    )
+            end;
+        Error ->
+            payment_import_error(
+                503,
+                <<"AO payment charge outcome is uncertain; automatic resubmission is disabled.">>,
+                Error
+            )
+    end.
+
+apply_charge(Base, Req, LedgerPath, NodeMsg) ->
+    case auto_withdraw_enabled(Base, NodeMsg) of
+        true ->
+            unsafe_auto_withdraw_error();
+        false ->
+            apply_ledger_charge(
+                Base,
+                LedgerPath,
+                ledger_charge_request(Req, NodeMsg),
+                NodeMsg
+            )
+    end.
+
+apply_ledger_charge(Base, LedgerPath, LedgerCharge, NodeMsg) ->
+    case auto_withdraw_enabled(Base, NodeMsg) of
+        true ->
+            unsafe_auto_withdraw_error();
+        false ->
+            LedgerRoute = normalize_route(LedgerPath),
+            LedgerOpts = ledger_resolve_opts(NodeMsg),
+            hb_ao:resolve(
+                #{
+                    <<"path">> => <<"(", LedgerRoute/binary, ")/push">>,
+                    <<"method">> => <<"POST">>,
+                    <<"body">> => LedgerCharge
+                },
+                LedgerOpts
+            )
+    end.
+
+unsafe_auto_withdraw_error() ->
+    payment_import_error(
+        500,
+        <<"AO payment auto-withdraw is disabled because submission is not settlement. Configure deposits to the beneficiary and set auto-withdraw=false.">>,
+        unsafe_auto_withdraw_configuration
+    ).
+
+ledger_charge_request(Req, NodeMsg) ->
+    Account = normalize_target(direct_get(<<"account">>, Req)),
+    Recipient = normalize_target(direct_get(<<"recipient">>, Req)),
+    Quantity = hb_util:int(direct_get(<<"quantity">>, Req)),
+    hb_message:commit(
+        #{
+            <<"path">> => <<"charge">>,
+            <<"account">> => Account,
+            <<"recipient">> => Recipient,
+            <<"quantity">> => Quantity
+        },
+        wallet_opts(NodeMsg)
+    ).
+
+with_account_lock(LedgerPath, Account, Fun) ->
+    Lock = {{?MODULE, node(), normalize_route(LedgerPath), Account}, self()},
+    case global:trans(Lock, Fun) of
+        aborted ->
+            payment_import_error(
+                503,
+                <<"Unable to acquire AO payment ledger charge lock.">>,
+                charge_lock_aborted
+            );
+        Result ->
+            Result
+    end.
+
+validate_charge_request(Base, Req, NodeMsg) ->
+    Account = normalize_target(direct_get(<<"account">>, Req)),
+    Recipient = normalize_target(direct_get(<<"recipient">>, Req)),
+    Quantity0 = direct_get(<<"quantity">>, Req),
+    Allowed = withdraw_authorized_signers(Base, NodeMsg),
+    Signers = verified_message_signers(Req, NodeMsg),
+    ChargeRecipients = configured_charge_recipients(NodeMsg),
+    case {
+        Account,
+        Recipient,
+        parse_positive_quantity(Quantity0),
+        [Signer || Signer <- Signers, lists:member(Signer, Allowed)],
+        lists:member(Recipient, ChargeRecipients),
+        ChargeRecipients
+    } of
+        {undefined, _, _, _, _, _} ->
+            withdraw_error(400, <<"AO payment charge is missing a single payer account.">>);
+        {_, undefined, _, _, _, _} ->
+            withdraw_error(400, <<"AO payment charge is missing a single recipient.">>);
+        {_, _, {error, _}, _, _, _} ->
+            withdraw_error(400, <<"AO payment charge has an invalid quantity.">>);
+        {_, _, _, _, _, []} ->
+            payment_import_error(
+                500,
+                <<"AO payment charge recipient is not configured.">>,
+                missing_charge_recipient
+            );
+        {_, _, _, [], _, _} ->
+            withdraw_error(403, <<"AO payment charge is not signed by the operator.">>);
+        {_, _, _, _, false, _} ->
+            withdraw_error(
+                403,
+                <<"AO payment charge recipient does not match configured p4 recipient.">>
+            );
+        {ValidAccount, ValidRecipient, {ok, Quantity}, [_ | _], true, _} ->
+            {ok, ValidAccount, ValidRecipient, Quantity}
+    end.
+
+balance_with_reservation(Base, LedgerPath, Account, Req, NodeMsg) ->
+    with_account_lock(
+        LedgerPath,
+        Account,
+        fun() ->
+            case read_p4_ledger_balance_at(
+                LedgerPath,
+                Account,
+                ledger_resolve_opts(NodeMsg)
+            ) of
+                {ok, Balance} ->
+                    reserve_balance(Base, Account, Balance, Req, NodeMsg);
+                Error ->
+                    Error
+            end
+        end
+    ).
+
+reserve_balance(Base, Account, Balance, Req, NodeMsg) ->
+    case load_reservations(Account, NodeMsg) of
+        {ok, State0} ->
+            {State, StateChanged} = prune_expired_reservations(State0),
+            Available = erlang:max(0, Balance - reserved_total(State)),
+            case reservation_request(Account, Req, NodeMsg) of
+                none ->
+                    maybe_store_pruned_reservations(
+                        Account,
+                        State,
+                        StateChanged,
+                        {ok, Available},
+                        NodeMsg
+                    );
+                {ok, Key} ->
+                    reserve_request(
+                        Base,
+                        Account,
+                        Key,
+                        Available,
+                        State,
+                        StateChanged,
+                        NodeMsg
+                    );
+                invalid ->
+                    maybe_store_pruned_reservations(
+                        Account,
+                        State,
+                        StateChanged,
+                        {ok, 0},
+                        NodeMsg
+                    )
+            end;
+        {error, Reason} ->
+            payment_import_error(
+                500,
+                <<"Unable to read AO payment reservation state.">>,
+                Reason
+            )
+    end.
+
+reserve_request(Base, Account, Key, Available, State, StateChanged, NodeMsg) ->
+    case maps:find(Key, State) of
+        {ok, #{ <<"status">> := <<"reserved">> }} ->
+            maybe_store_pruned_reservations(
+                Account,
+                State,
+                StateChanged,
+                {ok, 0},
+                NodeMsg
+            );
+        {ok, _Terminal} ->
+            maybe_store_pruned_reservations(
+                Account,
+                State,
+                StateChanged,
+                {ok, 0},
+                NodeMsg
+            );
+        error ->
+            Amount = reservation_amount(Base, NodeMsg),
+            case Amount > 0 andalso Available >= Amount of
+                true ->
+                    Now = erlang:system_time(millisecond),
+                    Entry = #{
+                        <<"status">> => <<"reserved">>,
+                        <<"amount">> => Amount,
+                        <<"created-at">> => Now,
+                        <<"expires-at">> => Now + reservation_ttl_ms(NodeMsg)
+                    },
+                    case store_reservations(Account, State#{ Key => Entry }, NodeMsg) of
+                        ok -> {ok, true};
+                        {error, Reason} ->
+                            payment_import_error(
+                                500,
+                                <<"Unable to persist AO payment reservation.">>,
+                                Reason
+                            )
+                    end;
+                false ->
+                    maybe_store_pruned_reservations(
+                        Account,
+                        State,
+                        StateChanged,
+                        {ok, 0},
+                        NodeMsg
+                    )
+            end
+    end.
+
+reservation_request(Account, Req, NodeMsg) ->
+    case normalize_target(direct_get(<<"target">>, Req)) of
+        undefined ->
+            %% p4@1.0's public balance handler nests the signed query but does
+            %% not set an outer target. Only its priced request admission path
+            %% supplies both target and request.
+            none;
+        Account ->
+            reservation_request_for_target(Account, Req, NodeMsg);
+        _OtherTarget ->
+            invalid
+    end.
+
+reservation_request_for_target(Account, Req, NodeMsg) ->
+    case direct_get(<<"request">>, Req) of
+        Request when is_map(Request) ->
+            case verified_message_signers(Request, NodeMsg) of
+                [Account] ->
+                    case request_key(Request, NodeMsg) of
+                        undefined -> invalid;
+                        Key -> {ok, Key}
+                    end;
+                _ ->
+                    invalid
+            end;
+        _ ->
+            invalid
+    end.
+
+request_key(undefined, _NodeMsg) ->
+    undefined;
+request_key({link, ID, _LinkOpts}, _NodeMsg) ->
+    normalize_target(ID);
+request_key(Request, NodeMsg) when is_map(Request) ->
+    try hb_util:human_id(hb_message:id(Request, signed, NodeMsg))
+    catch
+        _:_ -> undefined
+    end;
+request_key(_, _NodeMsg) ->
+    undefined.
+
+reservation_for(_Account, undefined, _NodeMsg) ->
+    not_found;
+reservation_for(Account, Key, NodeMsg) ->
+    case load_reservations(Account, NodeMsg) of
+        {ok, State0} ->
+            {State, Changed} = prune_expired_reservations(State0),
+            case persist_pruned_reservations(Account, State, Changed, NodeMsg) of
+                ok ->
+                    case maps:find(Key, State) of
+                        {ok, #{ <<"status">> := <<"reserved">> } = Reservation} ->
+                            {ok, Reservation, State};
+                        {ok, Terminal} ->
+                            {terminal, Terminal, State};
+                        error ->
+                            not_found
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+mark_reservation_charging(
+    Account,
+    Recipient,
+    Quantity,
+    Key,
+    LedgerCharge,
+    PayerBalance,
+    RecipientBalance,
+    State,
+    NodeMsg
+) ->
+    Now = erlang:system_time(millisecond),
+    Entry0 = maps:get(Key, State),
+    Entry = Entry0#{
+        <<"status">> => <<"charging">>,
+        <<"quantity">> => Quantity,
+        <<"recipient">> => Recipient,
+        <<"payer-balance-before">> => PayerBalance,
+        <<"recipient-balance-before">> => RecipientBalance,
+        <<"ledger-charge">> => LedgerCharge,
+        <<"charging-at">> => Now
+    },
+    NewState = State#{ Key => Entry },
+    case store_reservations(Account, NewState, NodeMsg) of
+        ok -> {ok, NewState};
+        Error -> Error
+    end.
+
+consume_reservation(Account, Key, Quantity, State, NodeMsg) ->
+    Entry0 = maps:get(Key, State),
+    Entry = Entry0#{
+        <<"status">> => <<"charged">>,
+        <<"quantity">> => Quantity,
+        <<"charged-at">> => erlang:system_time(millisecond)
+    },
+    case store_reservations(Account, State#{ Key => Entry }, NodeMsg) of
+        ok -> ok;
+        Error ->
+            Error
+    end.
+
+reserved_total(State) ->
+    maps:fold(
+        fun(_Key, Entry, Acc) ->
+            case hb_maps:get(<<"status">>, Entry, undefined, #{}) of
+                <<"reserved">> -> Acc + hb_maps:get(<<"amount">>, Entry, 0, #{});
+                <<"charging">> -> Acc + hb_maps:get(<<"amount">>, Entry, 0, #{});
+                _ -> Acc
+            end
+        end,
+        0,
+        State
+    ).
+
+prune_expired_reservations(State) ->
+    Now = erlang:system_time(millisecond),
+    NewState = maps:filter(
+        fun(_Key, Entry) ->
+            Status = hb_maps:get(<<"status">>, Entry, undefined, #{}),
+            Expires = hb_maps:get(<<"expires-at">>, Entry, 0, #{}),
+            Status =/= <<"reserved">> orelse Expires > Now
+        end,
+        State
+    ),
+    {NewState, NewState =/= State}.
+
+maybe_store_pruned_reservations(Account, State, Changed, Result, NodeMsg) ->
+    case persist_pruned_reservations(Account, State, Changed, NodeMsg) of
+        ok -> Result;
+        {error, Reason} ->
+            payment_import_error(
+                500,
+                <<"Unable to persist AO payment reservation state.">>,
+                Reason
+            )
+    end.
+
+persist_pruned_reservations(_Account, _State, false, _NodeMsg) ->
+    ok;
+persist_pruned_reservations(Account, State, true, NodeMsg) ->
+    store_reservations(Account, State, NodeMsg).
+
+load_reservations(Account, NodeMsg) ->
+    persistent_state_read(reservations_path(Account, NodeMsg), #{}, NodeMsg).
+
+store_reservations(Account, State, NodeMsg) ->
+    persistent_state_write(reservations_path(Account, NodeMsg), State, NodeMsg).
+
+reservations_path(Account, NodeMsg) ->
+    state_path(
+        <<"reservations">>,
+        {normalize_route(configured_ledger_path(NodeMsg)), Account}
+    ).
+
+reservation_amount(_Base, NodeMsg) ->
+    Value = configured_value(
+        <<"ao-payment-reservation-amount">>,
+        ao_payment_reservation_amount,
+        0,
+        NodeMsg
+    ),
+    non_negative_int(Value, 0).
+
+reservation_ttl_ms(NodeMsg) ->
+    positive_int_config(
+        <<"ao-payment-reservation-ttl-ms">>,
+        ao_payment_reservation_ttl_ms,
+        ?DEFAULT_RESERVATION_TTL_MS,
+        NodeMsg
+    ).
+
 %% @doc Verify that an AO message produced matching token debit/credit notices.
 verify(_Base, Req, NodeMsg) ->
-    TokenDefault =
-        configured_value(
-            <<"ao-payment-token">>,
-            ao_payment_token,
-            ?DEFAULT_AO_TOKEN,
-            NodeMsg
-        ),
-    LedgerDefault =
-        configured_value(
-            <<"ao-payment-ledger">>,
-            ao_payment_ledger,
-            undefined,
-            NodeMsg
-        ),
-    Token = request_value(<<"token">>, Req, TokenDefault),
-    Ledger = request_value(<<"ledger">>, Req, LedgerDefault),
-    DepositDefault =
-        case configured_value(
-            <<"ao-payment-deposit-address">>,
-            ao_payment_deposit_address,
-            undefined,
-            NodeMsg
-        ) of
-            undefined -> configured_value(<<"operator">>, operator, Ledger, NodeMsg);
-            Address -> Address
-        end,
-    DepositAddress =
-        request_value(<<"deposit-address">>, Req, DepositDefault),
     MessageID =
         case request_value(<<"message-id">>, Req, undefined) of
             undefined -> request_value(<<"id">>, Req, undefined);
@@ -161,46 +882,201 @@ verify(_Base, Req, NodeMsg) ->
         end,
     Slot = request_value(<<"slot">>, Req, undefined),
     Sender = request_value(<<"sender">>, Req, undefined),
-    Quantity = hb_util:bin(request_value(<<"quantity">>, Req, undefined)),
+    Quantity0 = request_value(<<"quantity">>, Req, undefined),
     RequestedRecipient = request_value(<<"recipient">>, Req, undefined),
-    case lists:any(fun(V) -> V =:= undefined orelse V =:= <<"undefined">> end,
-        [Token, Ledger, DepositAddress, MessageID, Slot, Sender, Quantity])
-    of
-        true ->
-            {error, #{
-                <<"status">> => 400,
-                <<"body">> => <<"Missing token, ledger, deposit-address, message-id, slot, sender, or quantity.">>
-            }};
-        false ->
-            case fetch_schedule(Token, Slot, NodeMsg) of
-                {ok, Result} ->
-                    LedgerPath = ledger_path(Req, NodeMsg),
-                    Expected = #{
-                        <<"token">> => Token,
-                        <<"ledger">> => Ledger,
-                        <<"deposit-address">> => DepositAddress,
-                        <<"message-id">> => MessageID,
-                        <<"slot">> => hb_util:bin(Slot),
-                        <<"sender">> => Sender,
-                        <<"quantity">> => Quantity,
-                        <<"ledger-path">> => LedgerPath,
-                        <<"requested-recipient">> => RequestedRecipient
-                    },
-                    case verify_schedule(Result, Expected, NodeMsg) of
-                        ok ->
-                            case fetch_result(Token, Slot, NodeMsg) of
-                                {ok, ComputeResult} ->
-                                    verify_result(ComputeResult, Expected, NodeMsg);
-                                {error, Reason} ->
-                                    fetch_error(Reason)
-                            end;
-                        Error ->
-                            Error
-                    end;
-                {error, Reason} ->
-                    fetch_error(Reason)
+    case configured_payment_scope(Req, NodeMsg) of
+        {error, ScopeError} ->
+            {error, ScopeError};
+        {ok, Token, Ledger, DepositAddress, LedgerPath} ->
+            case {
+                lists:any(fun missing_value/1, [MessageID, Slot, Sender, Quantity0]),
+                parse_positive_quantity(Quantity0),
+                normalize_target(Sender) =:= normalize_target(DepositAddress)
+            } of
+                {true, _, _} ->
+                    {error, #{
+                        <<"status">> => 400,
+                        <<"body">> => <<"Missing message-id, slot, sender, or quantity.">>
+                    }};
+                {false, {error, _}, _} ->
+                    {error, #{
+                        <<"status">> => 400,
+                        <<"body">> => <<"AO payment quantity must be positive.">>
+                    }};
+                {false, {ok, _Quantity}, true} ->
+                    {error, #{
+                        <<"status">> => 400,
+                        <<"body">> => <<"AO payment sender cannot be the deposit address.">>
+                    }};
+                {false, {ok, Quantity}, false} ->
+                    verify_payment(
+                        Token,
+                        Ledger,
+                        DepositAddress,
+                        LedgerPath,
+                        MessageID,
+                        Slot,
+                        Sender,
+                        hb_util:bin(Quantity),
+                        RequestedRecipient,
+                        NodeMsg
+                    )
             end
     end.
+
+verify_payment(
+    Token,
+    Ledger,
+    DepositAddress,
+    LedgerPath,
+    MessageID,
+    Slot,
+    Sender,
+    Quantity,
+    RequestedRecipient,
+    NodeMsg
+) ->
+    case fetch_schedule(Token, Slot, NodeMsg) of
+        {ok, Result} ->
+            Expected = #{
+                <<"token">> => Token,
+                <<"ledger">> => Ledger,
+                <<"deposit-address">> => DepositAddress,
+                <<"message-id">> => MessageID,
+                <<"slot">> => hb_util:bin(Slot),
+                <<"sender">> => Sender,
+                <<"quantity">> => Quantity,
+                <<"ledger-path">> => LedgerPath,
+                <<"requested-recipient">> => RequestedRecipient
+            },
+            case verify_schedule(Result, Expected, NodeMsg) of
+                ok ->
+                    case fetch_result(Token, Slot, NodeMsg) of
+                        {ok, ComputeResult} ->
+                            verify_result(ComputeResult, Expected, NodeMsg);
+                        {error, Reason} ->
+                            fetch_error(Reason)
+                    end;
+                Error ->
+                    Error
+            end;
+        {error, Reason} ->
+            fetch_error(Reason)
+    end.
+
+configured_payment_scope(Req, NodeMsg) ->
+    Token = configured_value(
+        <<"ao-payment-token">>,
+        ao_payment_token,
+        ?DEFAULT_AO_TOKEN,
+        NodeMsg
+    ),
+    DepositAddress =
+        case configured_value(
+            <<"ao-payment-deposit-address">>,
+            ao_payment_deposit_address,
+            undefined,
+            NodeMsg
+        ) of
+            undefined -> configured_value(<<"operator">>, operator, undefined, NodeMsg);
+            Address -> Address
+        end,
+    LedgerPath = configured_ledger_path(NodeMsg),
+    case configured_payment_ledger(LedgerPath, NodeMsg) of
+        {error, LedgerReason} ->
+            {error, #{
+                <<"status">> => 500,
+                <<"body">> => <<"AO payment ledger identity is not available.">>,
+                <<"reason">> => format_reason(LedgerReason)
+            }};
+        {ok, Ledger} ->
+            configured_payment_scope(
+                Req,
+                Token,
+                Ledger,
+                DepositAddress,
+                LedgerPath
+            )
+    end.
+
+configured_payment_scope(Req, Token, Ledger, DepositAddress, LedgerPath) ->
+    case lists:any(fun missing_value/1, [Token, Ledger, DepositAddress, LedgerPath]) of
+        true ->
+            {error, #{
+                <<"status">> => 500,
+                <<"body">> => <<"AO payment scope is not fully configured.">>
+            }};
+        false ->
+            Scope = [
+                {<<"token">>, Token},
+                {<<"ledger">>, Ledger},
+                {<<"deposit-address">>, DepositAddress},
+                {<<"ledger-path">>, LedgerPath}
+            ],
+            case lists:dropwhile(
+                fun({Key, Expected}) -> request_scope_matches(Key, Expected, Req) end,
+                Scope
+            ) of
+                [] ->
+                    {ok,
+                        normalize_target(Token),
+                        normalize_target(Ledger),
+                        normalize_target(DepositAddress),
+                        normalize_route(LedgerPath)};
+                [{Key, _Expected} | _] ->
+                    {error, #{
+                        <<"status">> => 400,
+                        <<"body">> => <<"AO payment request conflicts with configured scope.">>,
+                        <<"field">> => Key
+                    }}
+            end
+    end.
+
+configured_payment_ledger(LedgerPath, NodeMsg) ->
+    case configured_value(
+        <<"ao-payment-ledger">>,
+        ao_payment_ledger,
+        undefined,
+        NodeMsg
+    ) of
+        undefined -> derive_ledger_id(LedgerPath, NodeMsg);
+        Ledger -> {ok, normalize_target(Ledger)}
+    end.
+
+derive_ledger_id(undefined, _NodeMsg) ->
+    {error, missing_ledger_path};
+derive_ledger_id(LedgerPath, NodeMsg) ->
+    try
+        <<"/", NamedPath/binary>> = normalize_route(LedgerPath),
+        [LedgerName, _Device] = binary:split(NamedPath, <<"~">>),
+        Opts = ledger_resolve_opts(NodeMsg),
+        case hb_ao:resolve(
+            #{ <<"device">> => <<"node-process@1.0">> },
+            LedgerName,
+            Opts
+        ) of
+            {ok, LedgerMsg} ->
+                {ok, hb_util:human_id(hb_message:id(LedgerMsg, signed, Opts))};
+            {error, Reason} ->
+                {error, Reason}
+        end
+    catch
+        Class:CatchReason -> {error, {Class, CatchReason}}
+    end.
+
+request_scope_matches(Key, Expected, Req) ->
+    case direct_get(Key, Req) of
+        undefined -> true;
+        Supplied when Key =:= <<"ledger-path">> ->
+            normalize_route(Supplied) =:= normalize_route(Expected);
+        Supplied ->
+            normalize_target(Supplied) =:= normalize_target(Expected)
+    end.
+
+missing_value(undefined) -> true;
+missing_value(<<"undefined">>) -> true;
+missing_value(<<>>) -> true;
+missing_value(_) -> false.
 
 fetch_schedule(Token, Slot, NodeMsg) ->
     BaseURL = mainnet_url(NodeMsg),
@@ -359,24 +1235,57 @@ credit_to_payment(CreditMsg, Expected, NodeMsg) ->
             }}
     end.
 
-schedule_payment_import(Payment, NodeMsg) ->
+prepare_payment_import(Payment, NodeMsg) ->
     case read_ledger_balance(Payment, NodeMsg) of
         {ok, BeforeBalance} ->
-            case schedule_credit_notice(Payment, NodeMsg) of
-                {ok, _ScheduleResult} ->
-                    Quantity =
-                        hb_util:int(
-                            hb_maps:get(<<"quantity">>, Payment, undefined, NodeMsg)
-                        ),
-                    {ok, Payment#{
-                        <<"status">> => <<"scheduled">>,
-                        <<"balance-before">> => BeforeBalance,
-                        <<"expected-balance">> => BeforeBalance + Quantity
-                    }};
+            Quantity =
+                hb_util:int(
+                    hb_maps:get(<<"quantity">>, Payment, undefined, NodeMsg)
+                ),
+            {ok, Payment#{
+                <<"status">> => <<"prepared">>,
+                <<"balance-before">> => BeforeBalance,
+                <<"expected-balance">> => BeforeBalance + Quantity,
+                <<"credit-notice">> => prepare_credit_notice(Payment, NodeMsg)
+            }};
+        Error ->
+            Error
+    end.
+
+schedule_new_import(PaymentKey, PendingPayment, NodeMsg) ->
+    case schedule_credit_notice(PendingPayment, NodeMsg) of
+        {ok, _ScheduleResult} ->
+            ScheduledPayment = PendingPayment#{ <<"status">> => <<"scheduled">> },
+            case store_import(PaymentKey, ScheduledPayment, NodeMsg) of
+                ok -> settle_import(PaymentKey, ScheduledPayment, NodeMsg);
                 {error, Reason} ->
                     payment_import_error(
-                        502,
-                        <<"Unable to schedule AO payment credit into local ledger.">>,
+                        500,
+                        <<"AO payment was scheduled but its durable state could not be updated.">>,
+                        Reason
+                    )
+            end;
+        {error, Reason} ->
+            payment_import_error(
+                502,
+                <<"Unable to schedule AO payment credit into local ledger.">>,
+                Reason
+            )
+    end.
+
+settle_import(PaymentKey, PendingPayment, NodeMsg) ->
+    case await_imported_payment(PendingPayment, NodeMsg) of
+        {ok, ImportedPayment0} ->
+            ImportedPayment = maps:remove(
+                <<"credit-notice">>,
+                ImportedPayment0#{ <<"status">> => <<"imported">> }
+            ),
+            case store_import(PaymentKey, ImportedPayment, NodeMsg) of
+                ok -> {ok, ImportedPayment};
+                {error, Reason} ->
+                    payment_import_error(
+                        500,
+                        <<"AO payment settled but its durable import record could not be updated.">>,
                         Reason
                     )
             end;
@@ -384,25 +1293,48 @@ schedule_payment_import(Payment, NodeMsg) ->
             Error
     end.
 
-settle_import(PaymentKey, PendingPayment, Imports, NodeMsg) ->
-    case await_imported_payment(PendingPayment, NodeMsg) of
-        {ok, ImportedPayment} ->
-            store_import(PaymentKey, ImportedPayment, Imports, NodeMsg),
-            {ok, ImportedPayment};
+load_import(PaymentKey, NodeMsg) ->
+    case persistent_state_read(import_path(PaymentKey), undefined, NodeMsg) of
+        {ok, undefined} ->
+            load_legacy_import(PaymentKey, NodeMsg);
+        {ok, Payment} when is_map(Payment) ->
+            {ok, Payment};
+        {ok, _Invalid} ->
+            {error, invalid_import_state};
         Error ->
             Error
     end.
 
-store_import(PaymentKey, Payment, Imports, NodeMsg) ->
-    NewImports = Imports#{ PaymentKey => Payment },
-    hb_http_server:set_opts(
-        #{},
-        NodeMsg#{
-            ao_payment_imports => NewImports,
-            <<"ao-payment-imports">> => NewImports
-        }
-    ),
-    NewImports.
+load_legacy_import(PaymentKey, NodeMsg) ->
+    Imports = hb_opts:get(ao_payment_imports, #{}, NodeMsg),
+    case maps:find(PaymentKey, Imports) of
+        {ok, Payment} when is_map(Payment) ->
+            case store_import(PaymentKey, Payment, NodeMsg) of
+                ok -> {ok, Payment};
+                Error -> Error
+            end;
+        _ ->
+            not_found
+    end.
+
+store_import(PaymentKey, Payment, NodeMsg) ->
+    persistent_state_write(import_path(PaymentKey), Payment, NodeMsg).
+
+import_path(PaymentKey) ->
+    state_path(<<"imports">>, PaymentKey).
+
+with_payment_lock(PaymentKey, Fun) ->
+    Lock = {{?MODULE, node(), import, PaymentKey}, self()},
+    case global:trans(Lock, Fun) of
+        aborted ->
+            payment_import_error(
+                503,
+                <<"Unable to acquire AO payment import lock.">>,
+                import_lock_aborted
+            );
+        Result ->
+            Result
+    end.
 
 submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg) ->
     case maps:find(Key, Withdrawals) of
@@ -426,106 +1358,45 @@ submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg) ->
             end
     end.
 
-auto_withdraw_after_charge(Base, Req, NodeMsg) ->
-    case auto_withdraw_enabled(Base, NodeMsg) of
-        false ->
-            {ok, skipped};
-        true ->
-            case auto_withdrawal_from_charge(Base, Req, NodeMsg) of
-                {ok, Withdrawal} ->
-                    Key = withdrawal_key(Withdrawal),
-                    Withdrawals = hb_opts:get(ao_payment_withdrawals, #{}, NodeMsg),
-                    submit_and_store_withdrawal(Key, Withdrawal, Withdrawals, NodeMsg);
-                Error ->
-                    Error
-            end
-    end.
-
-auto_withdraw_enabled(Base, NodeMsg) ->
+auto_withdraw_enabled(_Base, NodeMsg) ->
     enabled(
-        hb_maps:get(
-            <<"auto-withdraw">>,
-            Base,
-            configured_value(
-                <<"ao-payment-auto-withdraw">>,
-                ao_payment_auto_withdraw,
-                false,
-                NodeMsg
-            ),
+        configured_value(
+            <<"ao-payment-auto-withdraw">>,
+            ao_payment_auto_withdraw,
+            false,
             NodeMsg
         )
     ).
 
-auto_withdrawal_from_charge(Base, Req, NodeMsg) ->
-    Token =
-        hb_maps:get(
-            <<"withdraw-token">>,
-            Base,
-            configured_value(
-                <<"ao-payment-token">>,
-                ao_payment_token,
-                ?DEFAULT_AO_TOKEN,
-                NodeMsg
-            ),
-            NodeMsg
-        ),
-    Recipient =
-        hb_maps:get(
-            <<"withdraw-recipient">>,
-            Base,
-            configured_value(
-                <<"ao-payment-withdraw-recipient">>,
-                ao_payment_withdraw_recipient,
-                undefined,
-                NodeMsg
-            ),
-            NodeMsg
-        ),
-    Quantity0 = direct_get(<<"quantity">>, Req),
-    case {Recipient, parse_positive_quantity(Quantity0)} of
-        {undefined, _} ->
-            withdraw_error(400, <<"Missing AO payment auto-withdraw recipient.">>);
-        {_, {error, _}} ->
-            withdraw_error(400, <<"Invalid AO payment auto-withdraw quantity.">>);
-        {_, {ok, Quantity}} ->
-            {ok, #{
-                <<"token">> => hb_util:human_id(Token),
-                <<"recipient">> => hb_util:human_id(Recipient),
-                <<"quantity">> => Quantity,
-                <<"withdraw-id">> =>
-                    auto_withdrawal_key(Req, Quantity, Recipient, NodeMsg),
-                <<"submit-url">> => submit_url(Base, NodeMsg)
-            }}
-    end.
-
-auto_withdrawal_key(Req, Quantity, Recipient, NodeMsg) ->
-    BaseKey =
-        try hb_message:id(Req, all, NodeMsg)
-        catch
-            _:_ ->
-                hb_util:encode(crypto:hash(sha256, term_to_binary(Req)))
-        end,
-    <<"p4:", BaseKey/binary, ":", (hb_util:bin(Quantity))/binary, ":",
-        (hb_util:human_id(Recipient))/binary>>.
+prepare_credit_notice(Payment, NodeMsg) ->
+    Opts = wallet_opts(NodeMsg),
+    Ledger = hb_maps:get(<<"ledger">>, Payment, undefined, NodeMsg),
+    hb_message:commit(
+        #{
+            <<"target">> => Ledger,
+            <<"type">> => <<"Message">>,
+            <<"action">> => <<"Credit-Notice">>,
+            <<"from-process">> => hb_maps:get(<<"token">>, Payment, undefined, NodeMsg),
+            <<"recipient">> => hb_maps:get(<<"recipient">>, Payment, undefined, NodeMsg),
+            <<"quantity">> => hb_util:int(hb_maps:get(<<"quantity">>, Payment, undefined, NodeMsg)),
+            <<"sender">> => hb_maps:get(<<"sender">>, Payment, undefined, NodeMsg),
+            <<"ao-payment-id">> => hb_maps:get(<<"message-id">>, Payment, undefined, NodeMsg)
+        },
+        Opts
+    ).
 
 schedule_credit_notice(Payment, NodeMsg) ->
     Opts = wallet_opts(NodeMsg),
-    Ledger = hb_maps:get(<<"ledger">>, Payment, undefined, NodeMsg),
     LedgerRoute = ledger_route(Payment, NodeMsg),
-    CreditNotice =
-        hb_message:commit(
-            #{
-                <<"target">> => Ledger,
-                <<"type">> => <<"Message">>,
-                <<"action">> => <<"Credit-Notice">>,
-                <<"from-process">> => hb_maps:get(<<"token">>, Payment, undefined, NodeMsg),
-                <<"recipient">> => hb_maps:get(<<"recipient">>, Payment, undefined, NodeMsg),
-                <<"quantity">> => hb_util:int(hb_maps:get(<<"quantity">>, Payment, undefined, NodeMsg)),
-                <<"sender">> => hb_maps:get(<<"sender">>, Payment, undefined, NodeMsg),
-                <<"ao-payment-id">> => hb_maps:get(<<"message-id">>, Payment, undefined, NodeMsg)
-            },
-            Opts
-        ),
+    CreditNotice = hb_maps:get(<<"credit-notice">>, Payment, undefined, NodeMsg),
+    case CreditNotice of
+        undefined ->
+            {error, missing_persisted_credit_notice};
+        _ ->
+            schedule_credit_notice_at(LedgerRoute, CreditNotice, Opts, NodeMsg)
+    end.
+
+schedule_credit_notice_at(LedgerRoute, CreditNotice, Opts, NodeMsg) ->
     Node = local_node(NodeMsg),
     try
         hb_http:post(
@@ -644,6 +1515,14 @@ read_ledger_balance_at(LedgerPath, Recipient, ResolveOpts) ->
     end.
 
 read_p4_ledger_balance_at(LedgerPath, Recipient, ResolveOpts) ->
+    read_p4_ledger_balance_at(
+        LedgerPath,
+        Recipient,
+        ResolveOpts,
+        ?LEDGER_READ_ATTEMPTS
+    ).
+
+read_p4_ledger_balance_at(LedgerPath, Recipient, ResolveOpts, Attempts) ->
     LedgerRoute = normalize_route(LedgerPath),
     BalancePath = <<LedgerRoute/binary, "/now/balance">>,
     case hb_ao:resolve(#{ <<"path">> => BalancePath }, ResolveOpts) of
@@ -653,6 +1532,14 @@ read_p4_ledger_balance_at(LedgerPath, Recipient, ResolveOpts) ->
             normalize_balance(Balance);
         {error, Reason} when Reason =:= not_found ->
             {ok, 0};
+        {error, _Reason} when Attempts > 1 ->
+            timer:sleep(?LEDGER_READ_RETRY_MS),
+            read_p4_ledger_balance_at(
+                LedgerPath,
+                Recipient,
+                ResolveOpts,
+                Attempts - 1
+            );
         {error, Reason} ->
             payment_import_error(
                 503,
@@ -748,7 +1635,7 @@ settlement_timeout_error(Payment, BeforeBalance, ExpectedBalance, LastSeen, Node
     Error = #{
         <<"status">> => 503,
         <<"body">> =>
-            <<"AO payment was verified and scheduled, but local ledger balance did not settle before timeout.">>,
+            <<"AO payment import did not settle before timeout; automatic scheduling retry is disabled.">>,
         <<"balance-before">> => BeforeBalance,
         <<"expected-balance">> => ExpectedBalance,
         <<"timeout-ms">> => Timeout,
@@ -795,15 +1682,11 @@ authorize_withdrawal_signer(Base, Req, NodeMsg) ->
             withdraw_error(403, <<"AO payment withdrawal request is not signed by the operator.">>)
     end.
 
-withdraw_authorized_signers(Base, NodeMsg) ->
+withdraw_authorized_signers(_Base, NodeMsg) ->
     lists:usort(
         [
             Signer
          || Signer <- [
-                normalize_target(hb_maps:get(<<"settlement-account">>, Base, undefined, NodeMsg)),
-                normalize_target(hb_maps:get(<<"operator">>, Base, undefined, NodeMsg)),
-                normalize_target(hb_maps:get(<<"p4-recipient">>, Base, undefined, NodeMsg)),
-                normalize_target(hb_maps:get(<<"ao-payment-deposit-address">>, Base, undefined, NodeMsg)),
                 normalize_target(configured_value(<<"operator">>, operator, undefined, NodeMsg)),
                 normalize_target(configured_value(<<"p4-recipient">>, p4_recipient, undefined, NodeMsg)),
                 normalize_target(
@@ -816,6 +1699,32 @@ withdraw_authorized_signers(Base, NodeMsg) ->
                 )
             ],
             Signer =/= undefined
+        ]
+    ).
+
+configured_charge_recipients(NodeMsg) ->
+    lists:usort(
+        [
+            Recipient
+         || Recipient <- [
+                normalize_target(
+                    configured_value(
+                        <<"p4-recipient">>,
+                        p4_recipient,
+                        undefined,
+                        NodeMsg
+                    )
+                ),
+                normalize_target(
+                    configured_value(
+                        <<"operator">>,
+                        operator,
+                        undefined,
+                        NodeMsg
+                    )
+                )
+            ],
+            Recipient =/= undefined
         ]
     ).
 
@@ -850,10 +1759,10 @@ has_commitments(_) ->
 
 validate_withdrawal_fields(Base, Req, NodeMsg) ->
     TokenDefault =
-        hb_maps:get(
-            <<"token">>,
-            Base,
-            hb_opts:get(ao_payment_token, ?DEFAULT_AO_TOKEN, NodeMsg),
+        configured_value(
+            <<"ao-payment-token">>,
+            ao_payment_token,
+            ?DEFAULT_AO_TOKEN,
             NodeMsg
         ),
     Token = request_value(<<"token">>, Req, TokenDefault),
@@ -895,10 +1804,11 @@ withdraw_secret(NodeMsg) ->
         NodeMsg
     ).
 
-allowed_withdraw_recipient(Base, NodeMsg) ->
-    hb_opts:get(
+allowed_withdraw_recipient(_Base, NodeMsg) ->
+    configured_value(
+        <<"ao-payment-withdraw-recipient">>,
         ao_payment_withdraw_recipient,
-        hb_maps:get(<<"withdraw-recipient">>, Base, undefined, NodeMsg),
+        undefined,
         NodeMsg
     ).
 
@@ -981,17 +1891,16 @@ post_legacy_mu(SubmitURL0, Item) ->
 http_options() ->
     [{timeout, ?HTTP_TIMEOUT_MS}, {connect_timeout, ?HTTP_TIMEOUT_MS}].
 
-submit_url(Base, NodeMsg) ->
-    Configured =
-        hb_opts:get(
-            ao_payment_submit_url,
-            hb_opts:get(ao_payment_mu_url, ?DEFAULT_SUBMIT_URL, NodeMsg),
+submit_url(_Base, NodeMsg) ->
+    configured_value(
+        <<"ao-payment-submit-url">>,
+        ao_payment_submit_url,
+        configured_value(
+            <<"ao-payment-mu-url">>,
+            ao_payment_mu_url,
+            ?DEFAULT_SUBMIT_URL,
             NodeMsg
         ),
-    hb_maps:get(
-        <<"submit-url">>,
-        Base,
-        hb_maps:get(<<"mu-url">>, Base, Configured, NodeMsg),
         NodeMsg
     ).
 
@@ -1083,11 +1992,8 @@ strip_trailing_slash(Path) ->
         _ -> Path
     end.
 
-ledger_path(Req, NodeMsg) ->
-    case direct_get(<<"ledger-path">>, Req) of
-        undefined -> configured_ledger_path(NodeMsg);
-        Path -> Path
-    end.
+ledger_path(_Req, NodeMsg) ->
+    configured_ledger_path(NodeMsg).
 
 request_value(Key, Req, Default) ->
     case direct_get(Key, Req) of
@@ -1136,6 +2042,60 @@ positive_int_config(BinaryKey, AtomKey, Default, NodeMsg) ->
         _ -> Default
     catch
         _:_ -> Default
+    end.
+
+non_negative_int(Value, Default) ->
+    try hb_util:int(Value) of
+        Int when Int >= 0 -> Int;
+        _ -> Default
+    catch
+        _:_ -> Default
+    end.
+
+state_path(Kind, Key) ->
+    Digest = hb_util:encode(crypto:hash(sha256, term_to_binary(Key))),
+    hb_path:to_binary([<<"~ao-payment@1.0">>, <<"state">>, Kind, Digest]).
+
+persistent_state_read(Path, Default, NodeMsg) ->
+    Opts = hb_store:scope(NodeMsg, local),
+    case hb_opts:get(store, no_viable_store, Opts) of
+        no_viable_store ->
+            {error, no_viable_store};
+        Store ->
+            case hb_store:read(Store, Path, Opts) of
+                {ok, Encoded} when is_binary(Encoded) ->
+                    decode_persistent_state(Encoded);
+                not_found ->
+                    {ok, Default};
+                {error, not_found} ->
+                    {ok, Default};
+                {error, Reason} ->
+                    {error, Reason};
+                Other ->
+                    {error, {unexpected_store_read, Other}}
+            end
+    end.
+
+decode_persistent_state(Encoded) ->
+    try binary_to_term(Encoded, [safe]) of
+        {?STATE_TERM_TAG, Value} -> {ok, Value};
+        _ -> {error, invalid_state_format}
+    catch
+        _:_ -> {error, invalid_state_encoding}
+    end.
+
+persistent_state_write(Path, Value, NodeMsg) ->
+    Opts = hb_store:scope(NodeMsg, local),
+    case hb_opts:get(store, no_viable_store, Opts) of
+        no_viable_store ->
+            {error, no_viable_store};
+        Store ->
+            Encoded = term_to_binary({?STATE_TERM_TAG, Value}, [compressed]),
+            case hb_store:write(Store, #{ Path => Encoded }, Opts) of
+                ok -> ok;
+                {error, Reason} -> {error, Reason};
+                Other -> {error, {unexpected_store_write, Other}}
+            end
     end.
 
 direct_get(Key, Map) when is_map(Map) ->
@@ -1201,9 +2161,132 @@ verify_result_requires_debit_and_credit_test() ->
 
 verify_rejects_missing_required_fields_test() ->
     ?assertMatch(
-        {error, #{ <<"status">> := 400 }},
+        {error, #{ <<"status">> := 500 }},
         verify(#{}, #{ <<"message-id">> => <<"message-id">> }, #{})
     ).
+
+configured_payment_scope_rejects_request_override_test() ->
+    Opts = #{
+        <<"ao-payment-token">> => <<"configured-token">>,
+        <<"ao-payment-ledger">> => <<"configured-ledger">>,
+        <<"ao-payment-deposit-address">> => <<"configured-deposit">>,
+        <<"ao-payment-ledger-path">> => <<"/ledger~node-process@1.0">>
+    },
+    ?assertMatch(
+        {ok, _, _, _, <<"/ledger~node-process@1.0">>},
+        configured_payment_scope(
+            #{
+                <<"token">> => <<"configured-token">>,
+                <<"ledger">> => <<"configured-ledger">>,
+                <<"deposit-address">> => <<"configured-deposit">>,
+                <<"ledger-path">> => <<"/ledger~node-process@1.0">>
+            },
+            Opts
+        )
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400, <<"field">> := <<"deposit-address">> }},
+        configured_payment_scope(
+            #{<<"deposit-address">> => <<"caller-controlled-address">>},
+            Opts
+        )
+    ).
+
+verify_rejects_self_transfer_and_non_positive_quantity_before_fetch_test() ->
+    Deposit = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Opts = #{
+        <<"ao-payment-token">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"ao-payment-ledger">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"ao-payment-deposit-address">> => Deposit,
+        <<"ao-payment-ledger-path">> => <<"/ledger~node-process@1.0">>
+    },
+    Request = #{
+        <<"message-id">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"slot">> => 1,
+        <<"sender">> => Deposit,
+        <<"quantity">> => 1
+    },
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        verify(#{}, Request, Opts)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        verify(
+            #{},
+            Request#{
+                <<"sender">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+                <<"quantity">> => 0
+            },
+            Opts
+        )
+    ).
+
+charge_validation_requires_operator_and_single_account_test() ->
+    Wallet = ar_wallet:new(),
+    Operator = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Payer = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Recipient = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Opts = #{
+        priv_wallet => Wallet,
+        <<"priv-wallet">> => Wallet,
+        <<"operator">> => Operator,
+        <<"p4-recipient">> => Recipient
+    },
+    Unsigned = #{
+        <<"account">> => Payer,
+        <<"recipient">> => Recipient,
+        <<"quantity">> => 7
+    },
+    Signed = hb_message:commit(Unsigned, Opts),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        validate_charge_request(#{}, Unsigned, Opts)
+    ),
+    ?assertEqual(
+        {ok, Payer, Recipient, 7},
+        validate_charge_request(#{}, Signed, Opts)
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        validate_charge_request(
+            #{},
+            hb_message:commit(Unsigned#{<<"account">> => [Payer]}, Opts),
+            Opts
+        )
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 400 }},
+        validate_charge_request(
+            #{},
+            hb_message:commit(maps:remove(<<"recipient">>, Unsigned), Opts),
+            Opts
+        )
+    ),
+    AttackerWallet = ar_wallet:new(),
+    Attacker = hb_util:human_id(ar_wallet:to_address(AttackerWallet)),
+    AttackerReq = hb_message:commit(
+        Unsigned,
+        #{ <<"priv-wallet">> => AttackerWallet }
+    ),
+    ?assertMatch(
+        {error, #{ <<"status">> := 403 }},
+        validate_charge_request(#{ <<"operator">> => Attacker }, AttackerReq, Opts)
+    ).
+
+trusted_node_scope_ignores_base_overrides_test() ->
+    Opts = #{
+        <<"ao-payment-ledger-path">> => <<"/trusted~node-process@1.0">>,
+        <<"ao-payment-reservation-amount">> => 2100
+    },
+    Base = #{
+        <<"ledger-path">> => <<"/caller~node-process@1.0">>,
+        <<"reservation-amount">> => 1
+    },
+    ?assertEqual(<<"/trusted~node-process@1.0">>, ledger_path(Base, Opts)),
+    ?assertEqual(2100, reservation_amount(Base, Opts)),
+    ?assertEqual(undefined, ledger_path(Base, #{})),
+    ?assertEqual(0, reservation_amount(Base, #{})).
 
 verify_schedule_matches_expected_transfer_test() ->
     Schedule = #{
@@ -1305,7 +2388,14 @@ p4_balance_missing_ledger_path_test() ->
 p4_balance_missing_target_returns_zero_test() ->
     ?assertEqual(
         {ok, 0},
-        balance(#{ <<"ledger-path">> => <<"/ledger~node-process@1.0">> }, #{}, #{})
+        balance(
+            #{},
+            #{},
+            #{
+                <<"ao-payment-ledger-path">> =>
+                    <<"/ledger~node-process@1.0">>
+            }
+        )
     ).
 
 p4_charge_missing_ledger_path_test() ->
@@ -1313,22 +2403,6 @@ p4_charge_missing_ledger_path_test() ->
         {error, #{ <<"status">> := 500 }},
         charge(#{}, #{}, #{})
     ).
-
-p4_auto_withdrawal_uses_configured_recipient_test() ->
-    Token = hb_util:encode(crypto:strong_rand_bytes(32)),
-    Recipient = hb_util:encode(crypto:strong_rand_bytes(32)),
-    NodeMsg = #{
-        <<"ao-payment-auto-withdraw">> => true,
-        <<"ao-payment-token">> => Token,
-        <<"ao-payment-withdraw-recipient">> => Recipient
-    },
-    Req = #{ <<"quantity">> => 7, <<"account">> => <<"payer">> },
-    ?assertEqual(true, auto_withdraw_enabled(#{}, NodeMsg)),
-    {ok, Withdrawal} = auto_withdrawal_from_charge(#{}, Req, NodeMsg),
-    ?assertEqual(Token, maps:get(<<"token">>, Withdrawal)),
-    ?assertEqual(Recipient, maps:get(<<"recipient">>, Withdrawal)),
-    ?assertEqual(7, maps:get(<<"quantity">>, Withdrawal)),
-    ?assertMatch(<<"p4:", _/binary>>, maps:get(<<"withdraw-id">>, Withdrawal)).
 
 p4_balance_target_uses_nested_request_target_test() ->
     ?assertEqual(
@@ -1494,6 +2568,227 @@ withdraw_posts_legacy_mu_test_() ->
             hb_mock_server:stop(MockHandle)
         end
     end}.
+
+reservation_request_requires_p4_admission_target_test() ->
+    Wallet = ar_wallet:new(),
+    Account = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    Request = hb_message:commit(
+        #{ <<"path">> => <<"/paid">> },
+        #{ <<"priv-wallet">> => Wallet }
+    ),
+    ?assertEqual(
+        none,
+        reservation_request(Account, #{ <<"request">> => Request }, #{})
+    ),
+    ?assertMatch(
+        {ok, _},
+        reservation_request(
+            Account,
+            #{ <<"target">> => Account, <<"request">> => Request },
+            #{}
+        )
+    ),
+    ?assertEqual(
+        invalid,
+        reservation_request(
+            Account,
+            #{
+                <<"target">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+                <<"request">> => Request
+            },
+            #{}
+        )
+    ).
+
+reservation_serializes_concurrent_admission_and_persists_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ao-payment-reservations">>),
+    hb_store:start(Store),
+    Wallet = ar_wallet:new(),
+    Account = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    LedgerPath = <<"/reservation-ledger~node-process@1.0">>,
+    Opts = #{
+        store => Store,
+        <<"store">> => Store,
+        <<"ao-payment-ledger-path">> => LedgerPath,
+        <<"ao-payment-reservation-amount">> => 2100
+    },
+    Requests = [
+        hb_message:commit(
+            #{ <<"path">> => <<"/paid">>, <<"nonce">> => N },
+            #{ <<"priv-wallet">> => Wallet }
+        )
+     || N <- lists:seq(1, 4)
+    ],
+    Parent = self(),
+    Ref = make_ref(),
+    [
+        spawn(fun() ->
+            Result = with_account_lock(
+                LedgerPath,
+                Account,
+                fun() ->
+                    reserve_balance(
+                        #{},
+                        Account,
+                        2100,
+                        #{ <<"target">> => Account, <<"request">> => Request },
+                        Opts
+                    )
+                end
+            ),
+            Parent ! {Ref, Result}
+        end)
+     || Request <- Requests
+    ],
+    Results = [receive {Ref, Result} -> Result end || _ <- Requests],
+    ?assertEqual(1, length([ok || {ok, true} <- Results])),
+    ?assertEqual(3, length([ok || {ok, 0} <- Results])),
+    RestartOpts = maps:without([ao_payment_imports, <<"ao-payment-imports">>], Opts),
+    {ok, Persisted} = load_reservations(Account, RestartOpts),
+    ?assertEqual(2100, reserved_total(Persisted)).
+
+charging_record_persists_exact_signed_charge_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ao-payment-charging">>),
+    hb_store:start(Store),
+    OperatorWallet = ar_wallet:new(),
+    Account = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Recipient = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Key = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Opts = #{
+        store => Store,
+        <<"store">> => Store,
+        priv_wallet => OperatorWallet,
+        <<"priv-wallet">> => OperatorWallet
+    },
+    Req = #{
+        <<"account">> => Account,
+        <<"recipient">> => Recipient,
+        <<"quantity">> => 7
+    },
+    LedgerCharge = ledger_charge_request(Req, Opts),
+    State = #{
+        Key => #{
+            <<"status">> => <<"reserved">>,
+            <<"amount">> => 10,
+            <<"expires-at">> => erlang:system_time(millisecond) + 60000
+        }
+    },
+    {ok, _} = mark_reservation_charging(
+        Account,
+        Recipient,
+        7,
+        Key,
+        LedgerCharge,
+        20,
+        3,
+        State,
+        Opts
+    ),
+    {ok, Persisted} = load_reservations(Account, Opts),
+    Entry = maps:get(Key, Persisted),
+    PersistedCharge = maps:get(<<"ledger-charge">>, Entry),
+    ?assertEqual(20, maps:get(<<"payer-balance-before">>, Entry)),
+    ?assertEqual(3, maps:get(<<"recipient-balance-before">>, Entry)),
+    ?assertEqual(
+        hb_message:id(LedgerCharge, all, Opts),
+        hb_message:id(PersistedCharge, all, Opts)
+    ),
+    ?assert(prepared_charge_matches(Entry, Req, Account, 7, Opts)),
+    ?assertNot(prepared_charge_matches(Entry, Req#{ <<"quantity">> => 8 }, Account, 8, Opts)),
+    ?assertNot(
+        prepared_charge_matches(
+            Entry,
+            Req#{ <<"recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)) },
+            Account,
+            7,
+            Opts
+        )
+    ).
+
+charge_reconciliation_never_assumes_an_unchanged_or_self_balance_test() ->
+    Reservation = #{
+        <<"payer-balance-before">> => 20,
+        <<"recipient-balance-before">> => 3
+    },
+    ?assert(charge_was_applied(
+        <<"payer">>, <<"recipient">>, 7, 13, 10, Reservation, #{}
+    )),
+    ?assertNot(charge_was_applied(
+        <<"payer">>, <<"recipient">>, 7, 20, 3, Reservation, #{}
+    )),
+    ?assertNot(charge_was_applied(
+        <<"same">>, <<"same">>, 7, 20, 20, Reservation, #{}
+    )).
+
+same_request_cannot_reuse_active_reservation_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ao-payment-replay">>),
+    hb_store:start(Store),
+    ClientWallet = ar_wallet:new(),
+    Account = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
+    LedgerPath = <<"/replay-ledger~node-process@1.0">>,
+    Opts = #{
+        store => Store,
+        <<"store">> => Store,
+        <<"ao-payment-ledger-path">> => LedgerPath,
+        <<"ao-payment-reservation-amount">> => 2100
+    },
+    Request = hb_message:commit(
+        #{ <<"path">> => <<"/paid">> },
+        #{ <<"priv-wallet">> => ClientWallet }
+    ),
+    ?assertEqual(
+        {ok, true},
+        with_account_lock(
+            LedgerPath,
+            Account,
+            fun() ->
+                reserve_balance(
+                    #{},
+                    Account,
+                    2100,
+                    #{ <<"target">> => Account, <<"request">> => Request },
+                    Opts
+                )
+            end
+        )
+    ),
+    ?assertEqual(
+        {ok, 0},
+        reserve_balance(
+            #{},
+            Account,
+            2100,
+            #{ <<"target">> => Account, <<"request">> => Request },
+            Opts
+        )
+    ).
+
+import_record_survives_fresh_options_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"ao-payment-imports">>),
+    hb_store:start(Store),
+    Opts = #{ store => Store, <<"store">> => Store },
+    Key = <<"token:message">>,
+    Payment = #{
+        <<"status">> => <<"prepared">>,
+        <<"message-id">> => <<"message">>,
+        <<"credit-notice">> => #{ <<"signed">> => <<"same-bytes">> }
+    },
+    ?assertEqual(ok, store_import(Key, Payment, Opts)),
+    ?assertEqual({ok, Payment}, load_import(Key, Opts)).
+
+auto_withdraw_configuration_fails_before_local_charge_test() ->
+    ?assertMatch(
+        {error, #{
+            <<"status">> := 500,
+            <<"reason">> := <<"unsafe_auto_withdraw_configuration">>
+        }},
+        apply_charge(
+            #{},
+            #{},
+            <<"/ledger~node-process@1.0">>,
+            #{ <<"ao-payment-auto-withdraw">> => true }
+        )
+    ).
 
 payment_expected(RequestedRecipient) ->
     #{
