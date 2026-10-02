@@ -97,6 +97,7 @@ Common node options:
     <<"ao-payment-mainnet-url">> => <<"https://state.forward.computer">>,
     <<"ao-payment-ledger-path">> => <<"/ledger~node-process@1.0">>,
     <<"ao-payment-deposit-address">> => DepositAddress,
+    <<"ao-payment-withdraw-recipient">> => BeneficiaryAddress,
     <<"ao-payment-reservation-amount">> => MaximumCharge,
     <<"ao-payment-reservation-ttl-ms">> => 600000,
     <<"ao-payment-auto-withdraw">> => false,
@@ -119,9 +120,13 @@ minting a second local credit. AO transfers whose sender is the configured
 deposit address are rejected because a self-transfer does not fund the node.
 
 Keep `ao-payment-auto-withdraw=false`. Configure AO deposits to go directly to
-the beneficiary. The manual `withdraw/3` API reports submission to the AO MU;
-an HTTP acceptance is not settlement proof and is not used by the paid
-inference flow.
+the beneficiary. The manual `withdraw/3` route accepts only the private boot
+secret or a verified operator signature, fixes the token and recipient from
+trusted node configuration, and stores the exact signed withdrawal before its
+single submission. A retry never resubmits a prepared or uncertain withdrawal.
+Use a unique `withdraw-id` for each intended transfer. The API reports
+submission to the AO MU; an HTTP acceptance is not settlement proof and is not
+used by the paid inference flow.
 
 ## Publish
 

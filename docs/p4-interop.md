@@ -40,3 +40,8 @@ retry never resubmits it. The device completes the record only when the
 expected debit and credit are visible; otherwise it fails closed with `503`.
 On a provider or pricing error, no response charge arrives and the reservation
 remains unavailable until its TTL expires.
+
+The separate manual withdrawal route follows the same at-most-once boundary:
+it stores the exact signed AO item before submitting it once. It accepts only
+the configured operator or private boot secret and only the configured token
+and beneficiary. Prepared or uncertain retries fail closed for reconciliation.

@@ -18,8 +18,17 @@ and validates that the AO token process emitted the expected payment notices.
 ## `withdraw/3`
 
 Submits a guarded AO transfer from the node wallet to the configured
-beneficiary. The route requires the boot-generated withdrawal secret so an
-exposed node is not turned into an arbitrary signing endpoint.
+beneficiary. The route requires either the boot-generated withdrawal secret or
+a verified signature from the configured operator. A P4 recipient or deposit
+beneficiary is not a withdrawal authority.
+
+The AO token and recipient come from trusted node configuration. The device
+serializes requests by `withdraw-id`, persists the exact signed AO item before
+one submission, and persists the submission result. A matching retry returns
+`already-submitted`; a prepared or uncertain record returns `503` for operator
+reconciliation and is never automatically resubmitted. Reusing a
+`withdraw-id` with different payment facts returns `409`. An AO MU 2xx response
+proves submission only, not settlement.
 
 ## `balance/3`
 
