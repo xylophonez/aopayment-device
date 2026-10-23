@@ -6,3 +6,7 @@
 /wallet.json
 /.rebar3/
 
+/cache-attested/
+/cache-mainnet/
+/logs/
+/build/

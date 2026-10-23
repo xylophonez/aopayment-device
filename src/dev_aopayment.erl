@@ -7,8 +7,8 @@
 %%% mainnet state before scheduling a local `Credit-Notice' into the configured
 %%% ledger process.
 -module(dev_aopayment).
--implements(<<"ao-payment@1.0">>).
--export([ingest/3, verify/3, withdraw/3, balance/3, charge/3]).
+-implements(<<"ao-payment@1.11">>).
+-export([device_info/0, ingest/3, verify/3, withdraw/3, balance/3, charge/3]).
 -include_lib("hb/include/hb.hrl").
 
 -ifdef(TEST).
@@ -25,6 +25,11 @@
 -define(LEDGER_READ_ATTEMPTS, 3).
 -define(LEDGER_READ_RETRY_MS, 10).
 -define(STATE_TERM_TAG, dev_aopayment_state_v1).
+
+%% @doc Public AO payment operations exposed to the resolver.
+device_info() ->
+    #{exports => [<<"ingest">>, <<"verify">>, <<"withdraw">>,
+        <<"balance">>, <<"charge">>]}.
 
 %% @doc Verify and import an AO token payment into the local ledger.
 ingest(Base, Req, NodeMsg) ->
@@ -1735,7 +1740,7 @@ message_signers(Msg, NodeMsg) ->
     end.
 
 normalize_target(Target) when is_binary(Target) ->
-    try hb_util:human_id(Target)
+    try hb_util:human_id(hb_util:committer_address(Target))
     catch _:_ -> Target
     end;
 normalize_target(_) ->
@@ -2206,7 +2211,7 @@ non_negative_int(Value, Default) ->
 
 state_path(Kind, Key) ->
     Digest = hb_util:encode(crypto:hash(sha256, term_to_binary(Key))),
-    hb_path:to_binary([<<"~ao-payment@1.0">>, <<"state">>, Kind, Digest]).
+    hb_path:to_binary([<<"~ao-payment@1.11">>, <<"state">>, Kind, Digest]).
 
 persistent_state_read(Path, Default, NodeMsg) ->
     Opts = hb_store:scope(NodeMsg, local),
