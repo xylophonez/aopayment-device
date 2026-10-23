@@ -675,8 +675,8 @@ reserve_request(Base, Account, Key, Available, State, StateChanged, NodeMsg) ->
                 NodeMsg
             );
         error ->
-            Amount = reservation_amount(Base, NodeMsg),
-            case Amount > 0 andalso Available >= Amount of
+            Amount = min(Available, reservation_amount(Base, NodeMsg)),
+            case Amount > 0 of
                 true ->
                     Now = erlang:system_time(millisecond),
                     Entry = #{
@@ -686,7 +686,7 @@ reserve_request(Base, Account, Key, Available, State, StateChanged, NodeMsg) ->
                         <<"expires-at">> => Now + reservation_ttl_ms(NodeMsg)
                     },
                     case store_reservations(Account, State#{ Key => Entry }, NodeMsg) of
-                        ok -> {ok, true};
+                        ok -> {ok, Amount};
                         {error, Reason} ->
                             payment_import_error(
                                 500,
@@ -2929,6 +2929,20 @@ reservation_request_requires_p4_admission_target_test() ->
         )
     ).
 
+reservation_is_numeric_and_bounded_by_available_credit_test() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"numeric-reservation">>),
+    hb_store:start(Store),
+    Opts = #{store => Store, <<"store">> => Store,
+        <<"ao-payment-reservation-amount">> => 100},
+    ?assertEqual({ok, 7}, reserve_request(#{}, <<"payer">>, <<"request">>,
+        7, #{}, false, Opts)),
+    {ok, State} = load_reservations(<<"payer">>, Opts),
+    ?assertEqual(7, reserved_total(State)),
+    ?assertEqual({ok, 100}, reserve_request(#{}, <<"other">>, <<"request">>,
+        1000, #{}, false, Opts)),
+    ?assertEqual({ok, 0}, reserve_request(#{}, <<"empty">>, <<"request">>,
+        0, #{}, false, Opts)).
+
 reservation_serializes_concurrent_admission_and_persists_test() ->
     Store = hb_test_utils:test_store(hb_store_volatile, <<"ao-payment-reservations">>),
     hb_store:start(Store),
@@ -2970,7 +2984,7 @@ reservation_serializes_concurrent_admission_and_persists_test() ->
      || Request <- Requests
     ],
     Results = [receive {Ref, Result} -> Result end || _ <- Requests],
-    ?assertEqual(1, length([ok || {ok, true} <- Results])),
+    ?assertEqual(1, length([ok || {ok, 2100} <- Results])),
     ?assertEqual(3, length([ok || {ok, 0} <- Results])),
     RestartOpts = maps:without([ao_payment_imports, <<"ao-payment-imports">>], Opts),
     {ok, Persisted} = load_reservations(Account, RestartOpts),
@@ -3066,7 +3080,7 @@ same_request_cannot_reuse_active_reservation_test() ->
         #{ <<"priv-wallet">> => ClientWallet }
     ),
     ?assertEqual(
-        {ok, true},
+        {ok, 2100},
         with_account_lock(
             LedgerPath,
             Account,
