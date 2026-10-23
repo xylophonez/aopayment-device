@@ -186,10 +186,13 @@ charge_locked(Base, Req, LedgerPath, Account, Recipient, Quantity, NodeMsg) ->
         {terminal, #{ <<"status">> := <<"charged">> } = Reservation, _State} ->
             case prepared_charge_matches(Reservation, Req, Account, Quantity, NodeMsg) of
                 true ->
-                    {ok, #{
-                        <<"status">> => <<"already-charged">>,
-                        <<"quantity">> => Quantity
-                    }};
+                    finish_reserved_charge(
+                        Reservation, Account, ReservationKey,
+                        {ok, #{
+                            <<"status">> => <<"already-charged">>,
+                            <<"quantity">> => Quantity
+                        }}, NodeMsg
+                    );
                 false ->
                     withdraw_error(
                         409,
@@ -394,10 +397,13 @@ reconcile_prepared_charge(
                                 NodeMsg
                             ) of
                                 ok ->
-                                    {ok, #{
-                                        <<"status">> => <<"already-charged">>,
-                                        <<"quantity">> => Quantity
-                                    }};
+                                    finish_reserved_charge(
+                                        maps:get(ReservationKey, State), Account, ReservationKey,
+                                        {ok, #{
+                                            <<"status">> => <<"already-charged">>,
+                                            <<"quantity">> => Quantity
+                                        }}, NodeMsg
+                                    );
                                 {error, Reason} ->
                                     payment_import_error(
                                         500,
@@ -472,14 +478,12 @@ complete_prepared_charge(
 ) ->
     case apply_ledger_charge(Base, LedgerPath, LedgerCharge, NodeMsg) of
         {ok, _} = Success ->
-            case consume_reservation(
-                Account,
-                ReservationKey,
-                Quantity,
-                State,
-                NodeMsg
+            case confirm_prepared_charge(
+                Account, ReservationKey, Quantity, State, NodeMsg
             ) of
-                ok -> Success;
+                ok -> finish_reserved_charge(
+                    maps:get(ReservationKey, State), Account, ReservationKey, Success, NodeMsg
+                );
                 {error, Reason} ->
                     payment_import_error(
                         500,
@@ -508,27 +512,22 @@ apply_charge(Base, Req, LedgerPath, NodeMsg) ->
             )
     end.
 
-apply_ledger_charge(Base, LedgerPath, LedgerCharge, NodeMsg) ->
-    case auto_withdraw_enabled(Base, NodeMsg) of
-        true ->
-            unsafe_auto_withdraw_error();
-        false ->
-            LedgerRoute = normalize_route(LedgerPath),
-            LedgerOpts = ledger_resolve_opts(NodeMsg),
-            hb_ao:resolve(
-                #{
-                    <<"path">> => <<"(", LedgerRoute/binary, ")/push">>,
-                    <<"method">> => <<"POST">>,
-                    <<"body">> => LedgerCharge
-                },
-                LedgerOpts
-            )
-    end.
+apply_ledger_charge(_Base, LedgerPath, LedgerCharge, NodeMsg) ->
+    LedgerRoute = normalize_route(LedgerPath),
+    LedgerOpts = ledger_resolve_opts(NodeMsg),
+    hb_ao:resolve(
+        #{
+            <<"path">> => <<"(", LedgerRoute/binary, ")/push">>,
+            <<"method">> => <<"POST">>,
+            <<"body">> => LedgerCharge
+        },
+        LedgerOpts
+    ).
 
 unsafe_auto_withdraw_error() ->
     payment_import_error(
         500,
-        <<"AO payment auto-withdraw is disabled because submission is not settlement. Configure deposits to the beneficiary and set auto-withdraw=false.">>,
+        <<"Automatic payout requires a positive reservation for a signed request.">>,
         unsafe_auto_withdraw_configuration
     ).
 
@@ -675,6 +674,8 @@ reserve_request(Base, Account, Key, Available, State, StateChanged, NodeMsg) ->
                 NodeMsg
             );
         error ->
+            %% P4 must compare its quoted price with this numeric guarantee.
+            %% A boolean true bypasses that check and admits work above the cap.
             Amount = min(Available, reservation_amount(Base, NodeMsg)),
             case Amount > 0 of
                 true ->
@@ -791,10 +792,145 @@ mark_reservation_charging(
         <<"ledger-charge">> => LedgerCharge,
         <<"charging-at">> => Now
     },
+    case payout_intent(Account, Recipient, Quantity, Key, NodeMsg) of
+        {ok, none} ->
+            store_charging_reservation(Account, Key, Entry, State, NodeMsg);
+        {ok, Intent} ->
+            store_charging_reservation(
+                Account, Key, Entry#{ <<"payout-intent">> => Intent },
+                State, NodeMsg
+            );
+        Error -> Error
+    end.
+
+store_charging_reservation(Account, Key, Entry, State, NodeMsg) ->
     NewState = State#{ Key => Entry },
     case store_reservations(Account, NewState, NodeMsg) of
         ok -> {ok, NewState};
         Error -> Error
+    end.
+
+%% @doc Bind a payout to the reserved charge before any ledger debit. The
+%% trusted node configuration is checked here and again by withdraw/3 on retry.
+payout_intent(Account, Recipient, Quantity, Key, NodeMsg) ->
+    case auto_withdraw_enabled(#{}, NodeMsg) of
+        false -> {ok, none};
+        true ->
+            case {Account =:= Recipient, reservation_amount(#{}, NodeMsg) > 0,
+                    Key =/= undefined} of
+                {true, _, _} -> {error, self_charge_cannot_fund_payout};
+                {_, false, _} -> {error, payout_requires_positive_reservation};
+                {_, _, false} -> {error, payout_requires_signed_request};
+                _ -> validated_payout_intent(Account, Quantity, Key, NodeMsg)
+            end
+    end.
+
+validated_payout_intent(Account, Quantity, Key, NodeMsg) ->
+    WalletOpts = wallet_opts(NodeMsg),
+    NodeAddress = normalize_target(maps:get(operator, WalletOpts)),
+    Deposit = normalize_target(configured_value(
+        <<"ao-payment-deposit-address">>, ao_payment_deposit_address,
+        NodeAddress, NodeMsg
+    )),
+    Token = normalize_target(configured_value(
+        <<"ao-payment-token">>, ao_payment_token, ?DEFAULT_AO_TOKEN, NodeMsg
+    )),
+    Beneficiary = normalize_target(allowed_withdraw_recipient(#{}, NodeMsg)),
+    Ledger = normalize_route(configured_ledger_path(NodeMsg)),
+    Binding = {NodeAddress, Deposit, Ledger, Account, Key, Token, Beneficiary, Quantity},
+    ID = hb_util:encode(crypto:hash(sha256, term_to_binary({p4_payout_v1, Binding}))),
+    Request = hb_message:commit(#{
+        <<"token">> => Token, <<"recipient">> => Beneficiary,
+        <<"quantity">> => Quantity, <<"withdraw-id">> => ID
+    }, WalletOpts),
+    case Deposit =:= NodeAddress of
+        false -> {error, payout_deposit_must_be_node_wallet};
+        true ->
+            case validate_withdrawal(#{}, Request, NodeMsg) of
+                {ok, Withdrawal} ->
+                    {ok, Withdrawal#{
+                        <<"node">> => NodeAddress, <<"deposit">> => Deposit,
+                        <<"ledger">> => Ledger, <<"payer">> => Account,
+                        <<"request-id">> => Key
+                    }};
+                Error -> Error
+            end
+    end.
+
+%% @doc A successful push must actually debit the ledger before payout. Keep
+%% the non-payout path unchanged; uncertainty retains the charging reservation.
+confirm_prepared_charge(Account, Key, Quantity, State, NodeMsg) ->
+    Entry = maps:get(Key, State),
+    case maps:is_key(<<"payout-intent">>, Entry) of
+        false -> consume_reservation(Account, Key, Quantity, State, NodeMsg);
+        true ->
+            Ledger = configured_ledger_path(NodeMsg),
+            Recipient = maps:get(<<"recipient">>, Entry),
+            Opts = ledger_resolve_opts(NodeMsg),
+            case {read_p4_ledger_balance_at(Ledger, Account, Opts),
+                    read_p4_ledger_balance_at(Ledger, Recipient, Opts)} of
+                {{ok, PayerBalance}, {ok, RecipientBalance}} ->
+                    case charge_was_applied(Account, Recipient, Quantity,
+                            PayerBalance, RecipientBalance, Entry, NodeMsg) of
+                        true -> consume_reservation(Account, Key, Quantity, State, NodeMsg);
+                        false -> {error, ledger_debit_not_confirmed}
+                    end;
+                Error -> {error, Error}
+            end
+    end.
+
+%% @doc All charged paths converge here after durable charge completion.
+%% P4 remains successful even if payout is pending: an operator can repeat the
+%% signed charge to inspect or resume payout without another debit or upload.
+finish_reserved_charge(#{ <<"payout-intent">> := _ }, Account, Key, Success, NodeMsg) ->
+    case load_reservations(Account, NodeMsg) of
+        {ok, State} ->
+            case maps:get(Key, State, undefined) of
+                #{ <<"status">> := <<"charged">>, <<"payout-intent">> := Intent } ->
+                    Result = try submit_reserved_payout(Intent, NodeMsg)
+                        catch Class:Reason -> {error, format_reason({Class, Reason})}
+                    end,
+                    payout_charge_response(Success, Intent, Result);
+                #{ <<"status">> := <<"charged">> } -> Success;
+                _ -> payout_charge_response(Success, #{}, {error, charge_not_durable})
+            end;
+        Error -> payout_charge_response(Success, #{}, Error)
+    end;
+finish_reserved_charge(_Entry, _Account, _Key, Success, _NodeMsg) ->
+    Success.
+
+submit_reserved_payout(Intent, NodeMsg) ->
+    WalletOpts = wallet_opts(NodeMsg),
+    NodeAddress = normalize_target(maps:get(operator, WalletOpts)),
+    Deposit = normalize_target(configured_value(
+        <<"ao-payment-deposit-address">>, ao_payment_deposit_address,
+        NodeAddress, NodeMsg
+    )),
+    case NodeAddress =:= maps:get(<<"node">>, Intent)
+            andalso Deposit =:= maps:get(<<"deposit">>, Intent)
+            andalso normalize_route(configured_ledger_path(NodeMsg)) =:=
+                maps:get(<<"ledger">>, Intent) of
+        false -> withdraw_error(409, <<"Payout identity or ledger configuration changed.">>);
+        true ->
+            Request = hb_message:commit(maps:with(
+                [<<"token">>, <<"recipient">>, <<"quantity">>, <<"withdraw-id">>],
+                Intent
+            ), WalletOpts),
+            withdraw(#{}, Request, NodeMsg)
+    end.
+
+payout_charge_response({ok, Charge}, Intent, Result) ->
+    Receipt = case Result of
+        {ok, Withdrawal} -> Withdrawal;
+        {error, Reason} -> #{
+            <<"status">> => <<"pending">>,
+            <<"withdraw-id">> => maps:get(<<"withdraw-id">>, Intent, <<>>),
+            <<"reason">> => Reason
+        }
+    end,
+    case is_map(Charge) of
+        true -> {ok, Charge#{ <<"payout">> => Receipt }};
+        false -> {ok, #{ <<"charge-result">> => Charge, <<"payout">> => Receipt }}
     end.
 
 consume_reservation(Account, Key, Quantity, State, NodeMsg) ->
@@ -2088,7 +2224,8 @@ withdrawal_key(Withdrawal) ->
 withdraw_error(Status, Body) ->
     {error, #{ <<"status">> => Status, <<"body">> => Body }}.
 
-wallet_opts(NodeMsg) ->
+wallet_opts(GivenNodeMsg) ->
+    NodeMsg = hb_http_server:with_node_committer(GivenNodeMsg),
     Wallet =
         case configured_wallet(NodeMsg) of
             not_found ->
@@ -2211,7 +2348,7 @@ non_negative_int(Value, Default) ->
 
 state_path(Kind, Key) ->
     Digest = hb_util:encode(crypto:hash(sha256, term_to_binary(Key))),
-    hb_path:to_binary([<<"~ao-payment@1.11">>, <<"state">>, Kind, Digest]).
+    hb_path:to_binary([<<"~ao-payment@1.0">>, <<"state">>, Kind, Digest]).
 
 persistent_state_read(Path, Default, NodeMsg) ->
     Opts = hb_store:scope(NodeMsg, local),
@@ -2327,16 +2464,16 @@ configured_payment_scope_rejects_request_override_test() ->
         <<"ao-payment-token">> => <<"configured-token">>,
         <<"ao-payment-ledger">> => <<"configured-ledger">>,
         <<"ao-payment-deposit-address">> => <<"configured-deposit">>,
-        <<"ao-payment-ledger-path">> => <<"/ledger~node-process@1.0">>
+        <<"ao-payment-ledger-path">> => <<"/~node-process@1.0/ledger">>
     },
     ?assertMatch(
-        {ok, _, _, _, <<"/ledger~node-process@1.0">>},
+        {ok, _, _, _, <<"/~node-process@1.0/ledger">>},
         configured_payment_scope(
             #{
                 <<"token">> => <<"configured-token">>,
                 <<"ledger">> => <<"configured-ledger">>,
                 <<"deposit-address">> => <<"configured-deposit">>,
-                <<"ledger-path">> => <<"/ledger~node-process@1.0">>
+                <<"ledger-path">> => <<"/~node-process@1.0/ledger">>
             },
             Opts
         )
@@ -2355,7 +2492,7 @@ verify_rejects_self_transfer_and_non_positive_quantity_before_fetch_test() ->
         <<"ao-payment-token">> => hb_util:encode(crypto:strong_rand_bytes(32)),
         <<"ao-payment-ledger">> => hb_util:encode(crypto:strong_rand_bytes(32)),
         <<"ao-payment-deposit-address">> => Deposit,
-        <<"ao-payment-ledger-path">> => <<"/ledger~node-process@1.0">>
+        <<"ao-payment-ledger-path">> => <<"/~node-process@1.0/ledger">>
     },
     Request = #{
         <<"message-id">> => hb_util:encode(crypto:strong_rand_bytes(32)),
@@ -2433,14 +2570,14 @@ charge_validation_requires_operator_and_single_account_test() ->
 
 trusted_node_scope_ignores_base_overrides_test() ->
     Opts = #{
-        <<"ao-payment-ledger-path">> => <<"/trusted~node-process@1.0">>,
+        <<"ao-payment-ledger-path">> => <<"/~node-process@1.0/trusted">>,
         <<"ao-payment-reservation-amount">> => 2100
     },
     Base = #{
-        <<"ledger-path">> => <<"/caller~node-process@1.0">>,
+        <<"ledger-path">> => <<"/~node-process@1.0/caller">>,
         <<"reservation-amount">> => 1
     },
-    ?assertEqual(<<"/trusted~node-process@1.0">>, ledger_path(Base, Opts)),
+    ?assertEqual(<<"/~node-process@1.0/trusted">>, ledger_path(Base, Opts)),
     ?assertEqual(2100, reservation_amount(Base, Opts)),
     ?assertEqual(undefined, ledger_path(Base, #{})),
     ?assertEqual(0, reservation_amount(Base, #{})).
@@ -2484,11 +2621,11 @@ verify_schedule_matches_expected_transfer_test() ->
 
 ledger_route_prefers_configured_path_test() ->
     ?assertEqual(
-        <<"/ledger~node-process@1.0">>,
+        <<"/~node-process@1.0/ledger">>,
         ledger_route(
             #{
                 <<"ledger">> => <<"ledger-id">>,
-                <<"ledger-path">> => <<"ledger~node-process@1.0/">>
+                <<"ledger-path">> => <<"/~node-process@1.0/ledger/">>
             },
             #{}
         )
@@ -2550,7 +2687,7 @@ p4_balance_missing_target_returns_zero_test() ->
             #{},
             #{
                 <<"ao-payment-ledger-path">> =>
-                    <<"/ledger~node-process@1.0">>
+                    <<"/~node-process@1.0/ledger">>
             }
         )
     ).
@@ -2948,7 +3085,7 @@ reservation_serializes_concurrent_admission_and_persists_test() ->
     hb_store:start(Store),
     Wallet = ar_wallet:new(),
     Account = hb_util:human_id(ar_wallet:to_address(Wallet)),
-    LedgerPath = <<"/reservation-ledger~node-process@1.0">>,
+    LedgerPath = <<"/~node-process@1.0/reservation-ledger">>,
     Opts = #{
         store => Store,
         <<"store">> => Store,
@@ -3068,7 +3205,7 @@ same_request_cannot_reuse_active_reservation_test() ->
     hb_store:start(Store),
     ClientWallet = ar_wallet:new(),
     Account = hb_util:human_id(ar_wallet:to_address(ClientWallet)),
-    LedgerPath = <<"/replay-ledger~node-process@1.0">>,
+    LedgerPath = <<"/~node-process@1.0/replay-ledger">>,
     Opts = #{
         store => Store,
         <<"store">> => Store,
@@ -3128,10 +3265,291 @@ auto_withdraw_configuration_fails_before_local_charge_test() ->
         apply_charge(
             #{},
             #{},
-            <<"/ledger~node-process@1.0">>,
+            <<"/~node-process@1.0/ledger">>,
             #{ <<"ao-payment-auto-withdraw">> => true }
         )
     ).
+
+payout_test_options() ->
+    Store = hb_test_utils:test_store(hb_store_volatile, <<"payout-test">>),
+    hb_store:start(Store),
+    Wallet = ar_wallet:new(),
+    Node = hb_util:human_id(ar_wallet:to_address(Wallet)),
+    #{
+        store => Store, <<"store">> => Store,
+        priv_wallet => Wallet, <<"priv-wallet">> => Wallet,
+        <<"operator">> => Node, <<"p4-recipient">> => Node,
+        <<"ao-payment-token">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"ao-payment-deposit-address">> => Node,
+        <<"ao-payment-withdraw-recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+        <<"ao-payment-ledger-path">> => <<"/~node-process@1.0/payout-ledger">>,
+        <<"ao-payment-reservation-amount">> => 10,
+        <<"ao-payment-auto-withdraw">> => true
+    }.
+
+payout_test_charge(Opts) ->
+    Account = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Key = hb_util:encode(crypto:strong_rand_bytes(32)),
+    Recipient = maps:get(<<"p4-recipient">>, Opts),
+    Req = #{ <<"account">> => Account, <<"recipient">> => Recipient,
+        <<"quantity">> => 7 },
+    LedgerCharge = ledger_charge_request(Req, Opts),
+    {ok, State} = mark_reservation_charging(Account, Recipient, 7, Key,
+        LedgerCharge, 20, 0,
+        #{ Key => #{ <<"status">> => <<"reserved">>, <<"amount">> => 10 } }, Opts),
+    {Account, Key, State}.
+
+payout_intent_is_exact_and_bound_before_debit_test() ->
+    Opts = payout_test_options(),
+    {Account, Key, State} = payout_test_charge(Opts),
+    {ok, State} = load_reservations(Account, Opts),
+    Entry = maps:get(Key, State),
+    ?assertEqual(<<"charging">>, maps:get(<<"status">>, Entry)),
+    Intent = maps:get(<<"payout-intent">>, Entry),
+    ?assertEqual(7, maps:get(<<"quantity">>, Intent)),
+    ?assertEqual(Account, maps:get(<<"payer">>, Intent)),
+    ?assertEqual(Key, maps:get(<<"request-id">>, Intent)),
+    ?assertEqual(maps:get(<<"operator">>, Opts), maps:get(<<"node">>, Intent)),
+    ?assertEqual(maps:get(<<"ao-payment-token">>, Opts), maps:get(<<"token">>, Intent)),
+    {ok, Intent} = payout_intent(Account, maps:get(<<"p4-recipient">>, Opts), 7, Key, Opts),
+    ID = maps:get(<<"withdraw-id">>, Intent),
+    Changes = [
+        {Account, 8, Key, Opts},
+        {<<"other-payer">>, 7, Key, Opts},
+        {Account, 7, <<"other-request">>, Opts},
+        {Account, 7, Key, Opts#{ <<"ao-payment-ledger-path">> => <<"/other">> }},
+        {Account, 7, Key, Opts#{ <<"ao-payment-token">> => hb_util:encode(crypto:strong_rand_bytes(32)) }},
+        {Account, 7, Key, Opts#{ <<"ao-payment-withdraw-recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)) }}
+    ],
+    [begin
+        {ok, Other} = payout_intent(A, maps:get(<<"p4-recipient">>, O), Q, K, O),
+        ?assertNotEqual(ID, maps:get(<<"withdraw-id">>, Other))
+    end || {A, Q, K, O} <- Changes].
+
+payout_rejects_self_unreserved_and_wrong_deposit_before_debit_test() ->
+    Opts = payout_test_options(),
+    Node = maps:get(<<"operator">>, Opts),
+    ?assertEqual({error, self_charge_cannot_fund_payout},
+        payout_intent(Node, Node, 7, <<"request">>, Opts)),
+    ?assertEqual({error, payout_requires_positive_reservation},
+        payout_intent(<<"payer">>, Node, 7, <<"request">>,
+            Opts#{ <<"ao-payment-reservation-amount">> => 0 })),
+    ?assertEqual({error, payout_requires_signed_request},
+        payout_intent(<<"payer">>, Node, 7, undefined, Opts)),
+    ?assertMatch({error, _},
+        payout_intent(<<"payer">>, Node, 7, <<"request">>,
+            maps:without([<<"ao-payment-withdraw-recipient">>,
+                <<"p4-recipient">>, <<"ao-payment-deposit-address">>], Opts))),
+    ?assertEqual({error, payout_deposit_must_be_node_wallet},
+        payout_intent(<<"payer">>, Node, 7, <<"request">>,
+            Opts#{ <<"ao-payment-deposit-address">> => <<"other">> })),
+    ?assertMatch({error, #{ <<"status">> := 403 }},
+        payout_intent(<<"payer">>, Node, 7, <<"request">>,
+            Opts#{ <<"operator">> => hb_util:encode(crypto:strong_rand_bytes(32)) })).
+
+payout_disabled_keeps_charge_only_state_test() ->
+    ?assertNot(auto_withdraw_enabled(#{}, #{})),
+    Opts = (payout_test_options())#{ <<"ao-payment-auto-withdraw">> => false },
+    {Account, Key, State} = payout_test_charge(Opts),
+    ?assertNot(maps:is_key(<<"payout-intent">>, maps:get(Key, State))),
+    ok = consume_reservation(Account, Key, 7, State, Opts),
+    Success = {ok, #{ <<"unchanged">> => true }},
+    ?assertEqual(Success, finish_reserved_charge(maps:get(Key, State), Account, Key, Success, Opts)).
+
+payout_waits_for_durable_charge_and_policy_matches_test() ->
+    Opts = payout_test_options(),
+    {Account, Key, State} = payout_test_charge(Opts),
+    Intent = maps:get(<<"payout-intent">>, maps:get(Key, State)),
+    Success = {ok, #{ <<"status">> => <<"already-charged">> }},
+    ?assertMatch({ok, #{ <<"payout">> := #{ <<"status">> := <<"pending">> }}},
+        finish_reserved_charge(maps:get(Key, State), Account, Key, Success, Opts)),
+    ?assertEqual(not_found, load_withdrawal(withdrawal_key(Intent), Opts)),
+    ok = consume_reservation(Account, Key, 7, State, Opts),
+    [begin
+        ?assertMatch({ok, #{ <<"payout">> := #{ <<"status">> := <<"pending">> }}},
+            finish_reserved_charge(maps:get(Key, State), Account, Key, Success, Changed)),
+        ?assertEqual(not_found, load_withdrawal(withdrawal_key(Intent), Opts))
+    end || Changed <- [
+        Opts#{ <<"ao-payment-withdraw-recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)) },
+        Opts#{ <<"ao-payment-token">> => hb_util:encode(crypto:strong_rand_bytes(32)) },
+        Opts#{ <<"ao-payment-deposit-address">> => <<"different-deposit">> },
+        Opts#{ <<"priv-wallet">> => ar_wallet:new() }
+    ]].
+
+payout_charged_retry_converges_once_after_reload_test_() ->
+    {timeout, 30, fun() ->
+        {ok, _} = application:ensure_all_started(hackney),
+        ok = hb_http:start(),
+        ok = hb_http_client:init_prometheus(),
+        {ok, URL, Mock} = hb_mock_server:start([
+            {"/", payout, {202, <<"{\"message\":\"Processing DataItem\"}">>}}
+        ]),
+        try
+            Opts = (payout_test_options())#{ <<"ao-payment-submit-url">> => URL },
+            {Account, Key, State} = payout_test_charge(Opts),
+            ok = consume_reservation(Account, Key, 7, State, Opts),
+            RestartOpts = Opts#{ <<"ao-payment-auto-withdraw">> => false },
+            Parent = self(), Ref = make_ref(),
+            [spawn(fun() -> Parent ! {Ref, finish_reserved_charge(maps:get(Key, State), Account, Key,
+                {ok, #{ <<"status">> => <<"already-charged">> }}, RestartOpts)} end)
+                || _ <- lists:seq(1, 4)],
+            Results = [receive {Ref, R} -> R after 10000 -> error(timeout) end
+                || _ <- lists:seq(1, 4)],
+            ?assertEqual(1, length([ok || {ok, #{ <<"payout">> :=
+                #{ <<"status">> := <<"submitted">> }}} <- Results])),
+            ?assertEqual(3, length([ok || {ok, #{ <<"payout">> :=
+                #{ <<"status">> := <<"already-submitted">> }}} <- Results])),
+            [Captured] = hb_mock_server:get_requests(payout, 1, Mock),
+            Item = ar_bundles:deserialize(maps:get(<<"body">>, Captured)),
+            ?assert(ar_bundles:verify_item(Item)),
+            ?assertEqual(hb_util:decode(maps:get(<<"ao-payment-token">>, Opts)), Item#tx.target),
+            ?assert(lists:member({<<"Quantity">>, <<"7">>}, Item#tx.tags)),
+            ?assert(lists:member({<<"Recipient">>, maps:get(<<"ao-payment-withdraw-recipient">>, Opts)}, Item#tx.tags)),
+            {ok, Persisted} = load_reservations(Account, Opts),
+            ?assertEqual(<<"charged">>, maps:get(<<"status">>, maps:get(Key, Persisted)))
+        after hb_mock_server:stop(Mock) end
+    end}.
+
+payout_prepared_and_uncertain_submission_never_retries_test() ->
+    [begin
+        Opts = payout_test_options(),
+        {Account, Key, State} = payout_test_charge(Opts),
+        Intent = maps:get(<<"payout-intent">>, maps:get(Key, State)),
+        ok = consume_reservation(Account, Key, 7, State, Opts),
+        Prepared = (prepare_withdrawal(Intent, Opts))#{ <<"status">> => Status },
+        ok = store_withdrawal(withdrawal_key(Intent), Prepared, Opts),
+        ?assertMatch({ok, #{ <<"payout">> := #{ <<"status">> := <<"pending">>,
+            <<"reason">> := #{ <<"status">> := 503 } }}},
+            finish_reserved_charge(maps:get(Key, State), Account, Key, {ok, #{}}, Opts)),
+        {ok, Prepared} = load_withdrawal(withdrawal_key(Intent), Opts)
+    end || Status <- [<<"prepared">>, <<"uncertain">>]].
+
+payout_crash_after_acceptance_keeps_prepared_and_never_resubmits_test() ->
+    Opts = payout_test_options(),
+    {Account, Key, State} = payout_test_charge(Opts),
+    Intent = maps:get(<<"payout-intent">>, maps:get(Key, State)),
+    Counter = atomics:new(1, []),
+    Submit = fun(_, _) -> atomics:add_get(Counter, 1, 1), exit(crash_after_acceptance) end,
+    WithdrawalKey = withdrawal_key(Intent),
+    ?assertExit(crash_after_acceptance,
+        submit_and_store_withdrawal(WithdrawalKey, Intent, Opts, Submit)),
+    {ok, #{ <<"status">> := <<"prepared">> }} = load_withdrawal(WithdrawalKey, Opts),
+    ok = consume_reservation(Account, Key, 7, State, Opts),
+    ?assertMatch({ok, #{ <<"payout">> := #{ <<"status">> := <<"pending">> }}},
+        finish_reserved_charge(maps:get(Key, State), Account, Key, {ok, #{}}, Opts)),
+    ?assertEqual(1, atomics:get(Counter, 1)).
+
+payout_native_ledger_fixture(NoDebit) ->
+    Opts0 = payout_test_options(),
+    PayerWallet = ar_wallet:new(),
+    Payer = hb_util:human_id(ar_wallet:to_address(PayerWallet)),
+    Name = <<"payout-integration-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
+    Ledger = <<"/~node-process@1.0/", Name/binary>>,
+    HBRoot = filename:dirname(filename:dirname(code:which(hb))),
+    {ok, TokenScript} = file:read_file(filename:join([HBRoot, "scripts", "hyper-token.lua"])),
+    {ok, P4Script0} = file:read_file(filename:join([HBRoot, "scripts", "hyper-token-p4.lua"])),
+    P4Script = case NoDebit of
+        true -> <<"function charge(base, assignment) base.result={status='error'}; return 'ok', base end">>;
+        false -> P4Script0
+    end,
+    {ok, MU, Mock} = hb_mock_server:start([
+        {"/", payout, {202, <<"{\"message\":\"Processing DataItem\"}">>}}
+    ]),
+    Node = hb_http_server:start_node(Opts0#{
+        <<"port">> => 0,
+        <<"ao-payment-ledger-path">> => Ledger,
+        <<"ao-payment-submit-url">> => MU,
+        <<"node-processes">> => #{ Name => #{
+            <<"device">> => <<"process@1.0">>,
+            <<"execution-device">> => <<"lua@5.3a">>,
+            <<"scheduler-device">> => <<"scheduler@1.0">>,
+            <<"module">> => [
+                #{ <<"content-type">> => <<"text/x-lua">>, <<"name">> => <<"token.lua">>, <<"body">> => TokenScript },
+                #{ <<"content-type">> => <<"text/x-lua">>, <<"name">> => <<"p4.lua">>, <<"body">> => P4Script }
+            ],
+            <<"balance">> => #{ Payer => 50 },
+            <<"admin">> => maps:get(<<"operator">>, Opts0)
+        }}
+    }),
+    Opts = hb_http_server:get_opts(),
+    Request = hb_message:commit(#{ <<"path">> => <<"/paid">> }, #{ <<"priv-wallet">> => PayerWallet }),
+    {ok, 10} = balance(#{}, #{ <<"target">> => Payer, <<"request">> => Request }, Opts),
+    Charge = hb_message:commit(#{
+        <<"account">> => Payer, <<"recipient">> => maps:get(<<"p4-recipient">>, Opts0),
+        <<"quantity">> => 7, <<"request">> => Request
+    }, Opts),
+    {Opts, Payer, Request, Charge, Node, Mock}.
+
+payout_native_first_charge_and_terminal_retry_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, Payer, _Request, Charge, _Node, Mock} = payout_native_ledger_fixture(false),
+        try
+            ?assertMatch({ok, #{ <<"payout">> := #{ <<"status">> := <<"submitted">> }}},
+                charge(#{}, Charge, Opts)),
+            ?assertEqual({ok, 43}, read_p4_ledger_balance_at(configured_ledger_path(Opts), Payer, Opts)),
+            ?assertMatch({ok, #{ <<"status">> := <<"already-charged">>,
+                <<"payout">> := #{ <<"status">> := <<"already-submitted">> }}},
+                charge(#{}, Charge, Opts)),
+            ?assertEqual(1, length(hb_mock_server:get_requests(Mock, payout))),
+            ?assertEqual({ok, 43}, read_p4_ledger_balance_at(configured_ledger_path(Opts), Payer, Opts))
+        after hb_mock_server:stop(Mock) end
+    end}.
+
+payout_native_debit_before_charged_crash_reconciles_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, Payer, Request, Charge, _Node, Mock} = payout_native_ledger_fixture(false),
+        try
+            Key = request_key(Request, Opts),
+            {ok, _Entry, State} = reservation_for(Payer, Key, Opts),
+            Recipient = maps:get(<<"p4-recipient">>, Opts),
+            LedgerCharge = ledger_charge_request(Charge, Opts),
+            {ok, _} = mark_reservation_charging(Payer, Recipient, 7, Key,
+                LedgerCharge, 50, 0, State, Opts),
+            {ok, _} = apply_ledger_charge(#{}, configured_ledger_path(Opts), LedgerCharge, Opts),
+            ?assertEqual([], hb_mock_server:get_requests(Mock, payout)),
+            ?assertMatch({ok, #{ <<"status">> := <<"already-charged">>,
+                <<"payout">> := #{ <<"status">> := <<"submitted">> }}},
+                charge(#{}, Charge, Opts)),
+            ?assertEqual({ok, 43}, read_p4_ledger_balance_at(configured_ledger_path(Opts), Payer, Opts)),
+            ?assertEqual(1, length(hb_mock_server:get_requests(Mock, payout)))
+        after hb_mock_server:stop(Mock) end
+    end}.
+
+payout_native_lua_error_without_debit_never_pays_test_() ->
+    {timeout, 60, fun() ->
+        {Opts, Payer, Request, Charge, _Node, Mock} = payout_native_ledger_fixture(true),
+        try
+            ?assertMatch({error, _}, charge(#{}, Charge, Opts)),
+            ?assertEqual({ok, 50}, read_p4_ledger_balance_at(configured_ledger_path(Opts), Payer, Opts)),
+            ?assertEqual([], hb_mock_server:get_requests(Mock, payout)),
+            ?assertMatch({terminal, #{ <<"status">> := <<"charging">> }, _},
+                reservation_for(Payer, request_key(Request, Opts), Opts)),
+            ?assertMatch({error, _}, charge(#{}, Charge, Opts)),
+            ?assertEqual([], hb_mock_server:get_requests(Mock, payout))
+        after hb_mock_server:stop(Mock) end
+    end}.
+
+request_scope_signing_uses_registered_node_wallet_test_() ->
+    {timeout, 30, fun() ->
+        Opts0 = payout_test_options(),
+        _Node = hb_http_server:start_node(Opts0#{ <<"port">> => 0 }),
+        Full = hb_http_server:get_opts(),
+        RequestOpts = maps:without([priv_wallet, <<"priv-wallet">>, <<"identities">>], Full),
+        Node = maps:get(<<"operator">>, Opts0),
+        Payment = #{ <<"ledger">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+            <<"token">> => maps:get(<<"ao-payment-token">>, Opts0),
+            <<"sender">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+            <<"recipient">> => hb_util:encode(crypto:strong_rand_bytes(32)),
+            <<"message-id">> => <<"signed-credit">>, <<"quantity">> => 7 },
+        Credit = prepare_credit_notice(Payment, RequestOpts),
+        ?assertEqual([Node], verified_message_signers(Credit, Full)),
+        Prepared = prepare_withdrawal(#{ <<"token">> => maps:get(<<"ao-payment-token">>, Opts0),
+            <<"recipient">> => maps:get(<<"ao-payment-withdraw-recipient">>, Opts0),
+            <<"quantity">> => 7 }, RequestOpts),
+        Item = maps:get(<<"signed-item">>, Prepared),
+        ?assert(ar_bundles:verify_item(Item)),
+        ?assertEqual(Node, hb_util:human_id(ar_wallet:to_address(Item#tx.owner, Item#tx.signature_type)))
+    end}.
 
 payment_expected(RequestedRecipient) ->
     #{
